@@ -87,6 +87,8 @@ Identifier = Annotated[str, Field(pattern=_IDENTIFIER_PATTERN)]
 Sha256Digest = Annotated[str, Field(pattern=_DIGEST_PATTERN)]
 GitObjectId = Annotated[str, Field(pattern=_GIT_OBJECT_ID_PATTERN)]
 PortableText = Annotated[str, Field(min_length=1, max_length=256)]
+# A shell-quoted argv as the input manifest displays it; paths make these long.
+CommandText = Annotated[str, Field(min_length=1, max_length=4096)]
 
 
 def is_project_state_path(relative_path: Path | str) -> bool:
@@ -778,6 +780,11 @@ class _BaseRunConfiguration(BaseModel):
     cli_timeout: Annotated[int, Field(gt=0)] | None = None
     compute_backend: PortableText
     profiler: PortableText | None = None
+    # The bundle-declared profiler command selected for this run, when
+    # ``--profiler auto`` yielded to it. ``profiler`` then records ``none``, so
+    # readers of the resolved kind are unaffected. A resume with ``--profiler
+    # none`` skips the command for that invocation without clearing it.
+    profiler_command: CommandText | None = None
     modality: PortableText | None = None
     default_reasoning_effort: PortableText | None = None
     outer_model: PortableText | None = None

@@ -206,6 +206,27 @@ def _resume_configuration_update(
     )
 
 
+def _keep_disabled_profiler_command(
+    recorded: RunConfiguration,
+    requested: RunConfiguration,
+    *,
+    requested_kind: ProfilerKind,
+) -> RunConfiguration:
+    """Keep the recorded bundle command when ``--profiler none`` skips it on resume.
+
+    Skipping the command is a per-invocation choice: the run still owns the
+    command, so a later resume without ``--profiler`` re-selects it. Any other
+    difference stays visible to the resume comparison.
+    """
+    if (
+        requested_kind is not ProfilerKind.NONE
+        or recorded.profiler_command is None
+        or requested.profiler_command is not None
+    ):
+        return requested
+    return requested.model_copy(update={"profiler_command": recorded.profiler_command})
+
+
 @overload
 def _coerce_dir_path(raw: str, label: str) -> str: ...
 
@@ -668,12 +689,22 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-00
             git.init(existing=existing, trusted_input_baseline=trusted_input_baseline)
         with boot_trace.span("project_state_resume"):
             effective_configuration = project_configuration.model_copy(
-                update={"profiler": resolved_profiler_kind.value}
+                update={
+                    "profiler": resolved_profiler_kind.value,
+                    "profiler_command": (
+                        selected_custom.command if selected_custom is not None else None
+                    ),
+                }
             )
             round_transaction_coordinator: RoundTransactionCoordinator | None = None
             if existing:
                 project_state.load_project()
                 run_manifest = project_state.load_run(run_id)
+                effective_configuration = _keep_disabled_profiler_command(
+                    run_manifest.configuration,
+                    effective_configuration,
+                    requested_kind=profiler_kind,
+                )
                 if git.trusted_input_baseline is None:
                     git.configure_trusted_input_baseline(run_manifest.trusted_input_baseline)
                 elif git.trusted_input_baseline != run_manifest.trusted_input_baseline:

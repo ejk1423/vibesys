@@ -144,6 +144,29 @@ def _restore_resume_run_environment(
     return changed
 
 
+def _restore_resume_custom_profiler(
+    args: argparse.Namespace,
+    explicit: frozenset[str],
+) -> bool:
+    """Restore ``--profiler`` for a run that selected its bundle-declared command.
+
+    Such a run records ``profiler = "none"`` beside ``profiler_command``, so
+    restoring the recorded kind would silently stop the command. Restoring
+    ``auto`` makes context creation re-select it. An explicit ``auto`` matches,
+    an explicit ``none`` skips the command for this invocation, and a built-in
+    kind is a change to the recorded profiler. Returns whether the explicit
+    value mismatched.
+    """
+    if "profiler" not in explicit:
+        args.profiler = ProfilerKind.AUTO
+        return False
+    requested = args.profiler
+    if not isinstance(requested, ProfilerKind):
+        message = f"argparse profiler value must be ProfilerKind, got {type(requested).__name__}"
+        raise TypeError(message)
+    return requested not in (ProfilerKind.AUTO, ProfilerKind.NONE)
+
+
 def _normalized_resume_cli_value(destination: str, value: object) -> object:
     if destination == "backend" and value is not None:
         if not isinstance(value, ComputeBackend):
@@ -230,6 +253,10 @@ def _restore_loop_resume_fields(
     """Restore a loop's budget and return its immutable CLI field map."""
     fields = dict(_COMMON_RESUME_CLI_FIELDS)
     changed: list[str] = _restore_resume_run_environment(args, recorded, explicit)
+    if recorded.profiler_command is not None and hasattr(args, "profiler"):
+        fields.pop("profiler")
+        if _restore_resume_custom_profiler(args, explicit):
+            changed.append("profiler")
     if isinstance(recorded, AgentRunConfiguration):
         _restore_resume_budget(
             args,

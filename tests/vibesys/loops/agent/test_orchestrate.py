@@ -741,6 +741,7 @@ def test_project_configuration_captures_effective_agent_behavior(tmp_path: Path)
         "cli_timeout": 900,
         "compute_backend": "cuda",
         "profiler": "auto",
+        "profiler_command": None,
         "max_rounds": 7,
         "max_retries_per_round": 4,
         "judge_every": 2,

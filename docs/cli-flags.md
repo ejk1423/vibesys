@@ -388,6 +388,9 @@ A task can also declare its own profiler in `vibesys.input.toml` (see the
 `--profiler auto` runs the declared command and skips the built-in kinds; an
 explicit built-in kind ignores the declaration and logs one framework warning;
 `--profiler none` disables both.
+A run that selected the declared command records it, so a resume re-selects
+it unless `--profiler none` is passed for that invocation; a resume whose
+bundle changed or dropped the command is rejected.
 
 Profiler prompts must match the interface, domain, and backend. In-process
 execution alone does not make the candidate Python or PyTorch-compatible; the

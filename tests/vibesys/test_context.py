@@ -886,6 +886,126 @@ def test_profiler_none_disables_the_declared_command_silently(tmp_path: Path) ->
     assert _framework_warnings(seen) == []
 
 
+def _recorded_profiler(project: Path, run_id: str) -> tuple[str | None, str | None]:
+    configuration = Project.open(project).state.load_run(run_id).configuration
+    return configuration.profiler, configuration.profiler_command
+
+
+def test_selected_custom_profiler_is_recorded_beside_profiler_none(tmp_path: Path) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        profiler_kind=ProfilerKind.AUTO,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as ctx:
+        run_id = ctx.run_id
+
+    assert _recorded_profiler(project, run_id) == ("none", "python prof.py")
+
+
+@pytest.mark.parametrize("requested", [ProfilerKind.MACOS_CPU, ProfilerKind.NONE])
+def test_unselected_custom_profiler_is_not_recorded(
+    tmp_path: Path, requested: ProfilerKind
+) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        profiler_kind=requested,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as ctx:
+        run_id = ctx.run_id
+
+    assert _recorded_profiler(project, run_id) == (requested.value, None)
+
+
+def test_resume_reselects_the_recorded_custom_profiler(tmp_path: Path) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        profiler_kind=ProfilerKind.AUTO,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as first:
+        run_id = first.run_id
+
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        exp_name=run_id,
+        existing=True,
+        profiler_kind=ProfilerKind.AUTO,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as resumed:
+        assert resumed.custom_profiler == _CUSTOM_PROFILER
+
+    assert _recorded_profiler(project, run_id) == ("none", "python prof.py")
+
+
+def test_resume_with_profiler_none_skips_the_command_without_clearing_it(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        profiler_kind=ProfilerKind.AUTO,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as first:
+        run_id = first.run_id
+
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        exp_name=run_id,
+        existing=True,
+        configuration=_configuration(max_rounds=2),
+        profiler_kind=ProfilerKind.NONE,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as resumed:
+        assert resumed.custom_profiler is None
+        assert resumed.profiler_enabled is False
+
+    stored = Project.open(project).state.load_run(run_id).configuration
+    assert isinstance(stored, AgentRunConfiguration)
+    assert stored.max_rounds == 2
+    assert (stored.profiler, stored.profiler_command) == ("none", "python prof.py")
+
+
+def test_resume_rejects_a_bundle_that_dropped_the_recorded_profiler_command(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        profiler_kind=ProfilerKind.AUTO,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as first:
+        run_id = first.run_id
+
+    with (
+        pytest.raises(ConfigurationError, match="profiler_command") as caught,
+        _create_context(
+            project,
+            evaluator=evaluator,
+            exp_name=run_id,
+            existing=True,
+            profiler_kind=ProfilerKind.AUTO,
+        ),
+    ):
+        pass
+    assert caught.value.diagnostic.code == "project_resume_configuration_mismatch"
+
+
 def test_portable_state_snapshot_replaces_namespace_exactly(tmp_path: Path) -> None:
     project = tmp_path / "queue"
     evaluator = _write_project(project)

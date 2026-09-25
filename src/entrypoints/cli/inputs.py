@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from entrypoints.cli.args import _build_validate_parser, _parse_command_flag
 from entrypoints.cli.constants import _STANDALONE_INPUT_DESTS
 from entrypoints.cli.environment import _validate_run_environment_profiler
-from entrypoints.cli.errors import _configuration_error
+from entrypoints.cli.errors import _configuration_error, _project_resume_mismatch
 from vibesys.api import DomainName, ProfilerKind
 from vibesys.api.request import (
     InputBundle,
@@ -21,7 +21,7 @@ from vibesys.api.request import (
     synthesize_input_bundle,
     validate_experiment_name,
 )
-from vs_project.api import Project, ProjectLayoutError
+from vs_project.api import Project, ProjectLayoutError, RunConfiguration
 
 if TYPE_CHECKING:
     import argparse
@@ -199,6 +199,7 @@ def _validate_target_inputs(args: argparse.Namespace) -> None:
     except (FileNotFoundError, ProjectLayoutError, ValueError) as exc:
         _configuration_error(str(exc), code="invalid_input", stage="input_loading")
 
+    _validate_resume_profiler_command(args)
     _apply_bundle_profiler_default(args)
 
     if args.resume is None and args.runs_dir is None:
@@ -210,6 +211,20 @@ def _validate_target_inputs(args: argparse.Namespace) -> None:
                 code="direct_project_materialization_unsupported",
                 stage="input_validation",
             )
+
+
+def _validate_resume_profiler_command(args: argparse.Namespace) -> None:
+    """Reject a resume whose bundle no longer declares the recorded profiler command.
+
+    The recorded ``profiler_command`` is the run's selected profiler, so it is
+    as immutable as the recorded kind. The resume restoration runs before the
+    bundle loads, so the command is checked here once the bundle is available.
+    """
+    recorded: RunConfiguration | None = getattr(args, "project_run_configuration", None)
+    if recorded is None or recorded.profiler_command is None:
+        return
+    if args.input_bundle.profiler_command_display != recorded.profiler_command:
+        _project_resume_mismatch(["profiler.command"])
 
 
 def _apply_bundle_profiler_default(args: argparse.Namespace) -> None:

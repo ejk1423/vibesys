@@ -278,6 +278,28 @@ def test_run_configuration_allows_optional_behavior_overrides_to_be_absent() -> 
     assert configuration.inner_reasoning_effort is None
 
 
+def test_run_configuration_round_trips_the_bundle_declared_profiler_command() -> None:
+    configuration = _configuration().model_copy(
+        update={"profiler": "none", "profiler_command": "python prof.py --fast"}
+    )
+
+    parsed = RUN_CONFIGURATION_ADAPTER.validate_python(configuration.model_dump(), strict=True)
+
+    assert parsed == configuration
+    assert parsed.profiler == "none"
+    assert parsed.profiler_command == "python prof.py --fast"
+
+
+def test_run_configuration_loads_a_recording_without_a_profiler_command() -> None:
+    raw = _configuration().model_dump()
+    del raw["profiler_command"]
+
+    parsed = RUN_CONFIGURATION_ADAPTER.validate_python(raw, strict=True)
+
+    assert parsed.profiler_command is None
+    assert parsed.model_dump()["profiler_command"] is None
+
+
 def test_run_configuration_is_frozen() -> None:
     configuration = _configuration()
     frozen_field = "inner_loop"
@@ -801,6 +823,7 @@ def test_run_manifest_persists_complete_agent_loop_behavior(tmp_path: Path) -> N
         "outer_model": "gpt-5.6-sol",
         "outer_reasoning_effort": "xhigh",
         "profiler": "linux-cpu",
+        "profiler_command": None,
         "run_environment": {
             "app": None,
             "gpu": None,
