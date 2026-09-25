@@ -108,6 +108,12 @@ entrypoint = "vibesys-queue"
 args = ["benchmark", "--workspace", "${PROJECT_ROOT}", "--scenario", "spsc"]
 ```
 
+A task may also declare its own profiler as an optional `[profiler]` table
+with the same command shape. Under `--profiler auto` the loop runs it after
+the candidate's gates pass and reads its output instead of a built-in
+profiler; an explicit `--profiler` kind ignores it. See the `[profiler]` notes
+under [Target Inputs](cli-flags.md#target-inputs).
+
 ## Container Topologies
 
 A `microservices` candidate is not a process the agent starts on its own: it is
@@ -211,6 +217,9 @@ vibesys \
   --input-benchmark-result-arg=--output-json \
   --input-evaluator-dir ./evaluation
 ```
+
+`--input-profiler-command` adds the optional `[profiler]` table to the
+synthesized manifest.
 
 Use this form for CI or programmatic integrations. Checked-in
 `OBJECTIVE.md` and `vibesys.input.toml` files are easier to review for projects
