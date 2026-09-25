@@ -3,7 +3,8 @@
 import json
 import shlex
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Unpack, cast
@@ -100,7 +101,7 @@ from vs_agent.api.testing import FakeAgentClient, FakeInvocation
 from vs_agent.stub_runner import StubAgentClient
 from vs_loop_state.api import RoundRecord
 from vs_project.api import Project, serialize_round
-from vs_sandbox.api import SandboxExecutionResult
+from vs_sandbox.api import LocalShellSandbox, SandboxExecutionResult
 
 if TYPE_CHECKING:
     from vibesys.run.protocol import LoopContext
@@ -4743,6 +4744,141 @@ def test_loop_skips_profiler_when_profiler_kind_is_none(tmp_path: Path, ref_file
     # Both rounds decide, including round 1; neither asked for a profile.
     assert len(_calls_for_response(fake, "orchestrator", PreRoundDecision)) == 2
     assert len(fake.calls_for("profiler")) == 0
+
+
+_CUSTOM_PROFILER_SUMMARY = ProfilerSummary(
+    analysis="custom command: decode is launch-bound",
+    bottlenecks="host-side sync",
+    suggestions="capture a CUDA graph",
+)
+_CUSTOM_PROFILER_TEXT = "hotspot: decode loop 73% of samples"
+
+
+def _declare_custom_profiler(ref_file: Path, *, structured: bool) -> str:
+    """Add a ``[profiler]`` command to the ``ref_file`` project; return its display form.
+
+    The script records ``$VIBESYS_PROFILE_DIR`` under that directory and then
+    prints either a JSON ``ProfilerSummary`` or plain text.
+    """
+    project = ref_file.parent
+    (project / "bin").mkdir()
+    payload = (
+        json.dumps(_CUSTOM_PROFILER_SUMMARY.model_dump()) if structured else _CUSTOM_PROFILER_TEXT
+    )
+    (project / "bin" / "prof.sh").write_text(
+        'printf \'%s\\n\' "$VIBESYS_PROFILE_DIR" > "$VIBESYS_PROFILE_DIR/where.txt"\n'
+        f"cat <<'EOF'\n{payload}\nEOF\n"
+    )
+    manifest = project / "vibesys.input.toml"
+    manifest.write_text(
+        manifest.read_text()
+        + '\n[profiler]\ncommand = ["sh", "bin/prof.sh"]\ntimeout_seconds = 30\n'
+    )
+    return "sh bin/prof.sh"
+
+
+@contextmanager
+def _recorded_sandbox_commands() -> Iterator[list[str]]:
+    """Record every command the local shell sandbox runs while still running it."""
+    commands: list[str] = []
+    real_execute = LocalShellSandbox.execute
+
+    def record(
+        self: LocalShellSandbox, command: str, *, timeout: int | None = None
+    ) -> SandboxExecutionResult:
+        commands.append(command)
+        return real_execute(self, command, timeout=timeout)
+
+    with patch.object(LocalShellSandbox, "execute", record):
+        yield commands
+
+
+def _profile_requesting_fake() -> FakeAgentClient:
+    """A fake whose round-1 pre-round decision asks for a profile."""
+    fake = _new_orchestrate_fake()
+    fake.enqueue(
+        "orchestrator",
+        *_orchestrator_turns(
+            [make_orchestrator_plan(task="Build server", criteria="ok", reasoning="start")],
+            [PreRoundDecision(need_profile=True, profile_focus="kernels", reasoning="need data")],
+        ),
+    )
+    return fake
+
+
+def test_loop_runs_custom_profiler_command_and_uses_its_structured_summary(
+    tmp_path: Path, ref_file: Path
+) -> None:
+    """``--profiler auto`` selects the bundle's command; a JSON summary needs no agent turn."""
+    display = _declare_custom_profiler(ref_file, structured=True)
+    fake = _profile_requesting_fake()
+
+    with _recorded_sandbox_commands() as commands:
+        result = _invoke_orchestrate(
+            tmp_path, ref_file, fake, max_rounds=1, profiler_kind=ProfilerKind.AUTO
+        )
+
+    assert result is True
+    [profiler_command] = [c for c in commands if "VIBESYS_PROFILE_DIR=" in c]
+    assert profiler_command.endswith(f" {display}")
+    assert fake.calls_for("profiler") == []
+    project = _created_project(tmp_path)
+    [where] = list(project.rglob("where.txt"))
+    assert where.read_text().strip() == str(where.parent.relative_to(project))
+    progress = issue_board.resolve_paths(project, "files")[1].read_text()
+    assert "## Round 1 — Profiler" in progress
+    assert _CUSTOM_PROFILER_SUMMARY.analysis in progress
+    # The pre-round orchestrator learns which command the framework will run.
+    [pre_round] = _calls_for_response(fake, "orchestrator", PreRoundDecision)
+    assert f"`{display}`" in pre_round.system_prompt
+    assert "Standalone profiling is disabled" not in pre_round.system_prompt
+
+
+def test_loop_hands_custom_profiler_text_to_the_profiler_agent(
+    tmp_path: Path, ref_file: Path
+) -> None:
+    """Plain-text output is interpreted by one tool-less profiler turn."""
+    _declare_custom_profiler(ref_file, structured=False)
+    fake = _profile_requesting_fake()
+    fake.enqueue("profiler", _CUSTOM_PROFILER_SUMMARY)
+
+    with _recorded_sandbox_commands() as commands:
+        result = _invoke_orchestrate(
+            tmp_path, ref_file, fake, max_rounds=1, profiler_kind=ProfilerKind.AUTO
+        )
+
+    assert result is True
+    assert len([c for c in commands if "VIBESYS_PROFILE_DIR=" in c]) == 1
+    [profiler_call] = fake.calls_for("profiler")
+    assert profiler_call.mcp_servers is None
+    assert _CUSTOM_PROFILER_TEXT in profiler_call.system_prompt
+    assert "Do not run that command again" in profiler_call.system_prompt
+    assert "Recent campaign context" in profiler_call.system_prompt
+    assert "Read-only evidence boundary" in profiler_call.system_prompt
+    project = _created_project(tmp_path)
+    progress = issue_board.resolve_paths(project, "files")[1].read_text()
+    assert _CUSTOM_PROFILER_SUMMARY.analysis in progress
+
+
+def test_loop_explicit_builtin_profiler_ignores_the_declared_command(
+    tmp_path: Path, ref_file: Path
+) -> None:
+    """An explicit built-in ``--profiler`` shadows the bundle's command entirely."""
+    display = _declare_custom_profiler(ref_file, structured=True)
+    fake = _profile_requesting_fake()
+
+    with _recorded_sandbox_commands() as commands:
+        result = _invoke_orchestrate(
+            tmp_path, ref_file, fake, max_rounds=1, profiler_kind=ProfilerKind.HEADROOM
+        )
+
+    assert result is True
+    assert not [c for c in commands if "VIBESYS_PROFILE_DIR=" in c]
+    [profiler_call] = fake.calls_for("profiler")
+    assert profiler_call.mcp_servers is not None
+    [pre_round] = _calls_for_response(fake, "orchestrator", PreRoundDecision)
+    assert display not in pre_round.system_prompt
+    assert "`headroom` profiling through" in pre_round.system_prompt
 
 
 def test_loop_generic_auto_profiler_resolves_to_macos_cpu(tmp_path: Path, ref_file: Path) -> None:

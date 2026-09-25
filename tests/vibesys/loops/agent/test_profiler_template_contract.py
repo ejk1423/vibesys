@@ -43,9 +43,13 @@ from vs_prompts.api import filter_skip_marked
 _PROFILERS_DIR = PROMPTS_DIR / "loops" / "agent" / "profilers"
 _AGENT_LOOP_ROOT = PROMPTS_DIR / "loops" / "agent"
 
-# Exactly the kwargs _run_profiler (src/vibesys/loops/agent/loop.py:834-846)
-# passes to whichever profiler template profiler_kind resolves to. Keep this
-# in sync with that call site, not with any individual template.
+# Exactly the kwargs _run_profiler (src/vibesys/loops/agent/loop.py) passes
+# to whichever profiler template profiler_kind resolves to: the shared
+# ``prompt_kwargs`` dict (~line 786) plus the three built-in-only kwargs at
+# the built-in render (~line 844). Keep this in sync with that call site,
+# not with any individual template. ``profilers/custom.j2`` is rendered
+# with the shared dict plus ``custom_profiler_prompt_context`` and marks
+# the built-in-only kwargs as deliberately unused.
 _RUN_PROFILER_KWARGS: dict[str, object] = {
     "profile_focus": "General bottleneck analysis.",
     "benchmark_command": "uv run python benchmark/benchmark.py",

@@ -25,11 +25,10 @@ from vibesys.evaluators.input_manifest import load_input_bundle
 from vibesys.loops.agent.loop import (
     _INTERFACES,
     DEFAULT_INTERFACE,
-    _effective_profiler_definition,
-    _profiler_prompt_template,
     run_agent_loop,
 )
 from vibesys.loops.metrics import MetricSpace
+from vibesys.loops.profiler import effective_profiler_definition
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, render_template
 
@@ -37,6 +36,17 @@ if TYPE_CHECKING:
     from pathlib import Path
 _TEMPLATE_DIR = PROMPTS_DIR / "loops" / "agent"
 _CRITERION_TEXT = "PC"
+
+
+def _profiler_prompt_template(
+    profiler_kind: ProfilerKind,
+    *,
+    supports_torch_profiler: bool = False,
+) -> str:
+    """The prompt the agent loop renders for a resolved built-in profiler kind."""
+    return effective_profiler_definition(
+        profiler_kind, supports_torch_profiler=supports_torch_profiler
+    ).prompt_template
 
 
 def test_domain_module_has_no_language_axis() -> None:
@@ -270,7 +280,7 @@ def _render_single_agent(
     supports_torch_profiler: bool = False,
 ) -> str:
     effective_profiler = (
-        _effective_profiler_definition(
+        effective_profiler_definition(
             profiler_kind,
             supports_torch_profiler=supports_torch_profiler,
         )

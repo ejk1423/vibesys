@@ -7,6 +7,7 @@ collect kernel-level data first.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import shlex
@@ -93,13 +94,19 @@ from vibesys.loops.metrics import (
     Measurement,
     MetricSpace,
 )
-from vibesys.loops.profiler import mcp_spec as profiler_mcp_spec
-from vibesys.profilers import (
-    ProfilerDefinition,
-    ProfilerKind,
-    profiler_definition,
-    require_profiler_kind,
+from vibesys.loops.profiler import (
+    CUSTOM_PROFILER_TEMPLATE,
+    CustomProfilerRun,
+    ProfilerTurn,
+    custom_profiler_prompt_context,
+    custom_profiler_summary,
+    declared_custom_profiler,
+    effective_profiler_definition,
+    invoke_profiler_agent,
+    warn_profiler_failed,
 )
+from vibesys.loops.profiler import mcp_spec as profiler_mcp_spec
+from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, render_template
 from vibesys.render.sink import output_sink
 from vibesys.run import LocalRunIntegration, LoopContext, RunStateNamespace
@@ -704,6 +711,9 @@ def _run_pre_round_decision(
         exhaustion_info=carry.exhaustion_info,
         progress_location=progress_location,
         profiler_kind=ctx.profiler_kind.value,
+        custom_profiler_command=(
+            ctx.custom_profiler.command if ctx.custom_profiler is not None else None
+        ),
         profile_execution=ctx.run_environment_view.profile_execution,
         has_history=has_history,
     )
@@ -730,84 +740,9 @@ def _run_pre_round_decision(
     return decision
 
 
-def _profiler_prompt_template(
-    profiler_kind: ProfilerKind,
-    *,
-    supports_torch_profiler: bool = False,
-) -> str:
-    """Pick the prompt for the profiler resolved during context creation."""
-    return _effective_profiler_definition(
-        profiler_kind,
-        supports_torch_profiler=supports_torch_profiler,
-    ).prompt_template
-
-
-def _effective_profiler_definition(
-    profiler_kind: ProfilerKind,
-    *,
-    supports_torch_profiler: bool = False,
-) -> ProfilerDefinition:
-    """Return the already-resolved profiler declaration.
-
-    Context creation resolves the requested profiler against both the domain
-    and the run environment's declared capabilities.  Do not perform a second
-    interface-based substitution here: it can replace a supported remote
-    capture path with a profiler that the environment cannot execute.
-    """
-    kind = require_profiler_kind(profiler_kind)
-    if kind is ProfilerKind.NONE:
-        message = "No profiler prompt exists when profiling is disabled."
-        raise ValueError(message)
-    definition = profiler_definition(kind)
-    if definition.requires_domain_torch_support and not supports_torch_profiler:
-        message = "The selected domain does not provide Torch profiler support."
-        raise ValueError(message)
-    return definition
-
-
-def _run_profiler(
-    ctx: LoopContext,
-    request: LoopRunRequest,
-    progress: RoundProgress,
-    profile_focus: str,
-    progress_path: Path,
-) -> ProfilerSummary | None:
-    bundle = request.input_bundle
-    round_number = progress.round_number
-    domain_definition = resolve_domain(bundle.domain)
-    modality = request.modality
-    if modality is None and bundle.domain is constants.DomainName.LLM_SERVING:
-        modality = "text_generation"
-    interface = request.interface
-    objective = request.objective or bundle.objective
-    template = _profiler_prompt_template(
-        ctx.profiler_kind,
-        supports_torch_profiler=domain_definition.supports_torch_profiler,
-    )
-    domain_profiler = render_domain_section(
-        domain_definition,
-        DomainRole.PROFILER,
-        **_domain_render_context(ctx, modality, interface),
-    )
-    system_prompt = render_template(
-        template,
-        template_dir=_TEMPLATE_DIR,
-        profile_focus=profile_focus,
-        benchmark_command=ctx.profiler_benchmark_command,
-        modality=modality,
-        domain_profiler=domain_profiler,
-        runtime_notes=ctx.run_environment_view.prompt_notes,
-        profile_execution=ctx.run_environment_view.profile_execution,
-        objective=objective,
-        profiler_support_name=profiler_definition(ctx.profiler_kind).support_name,
-        profiler_mcp_name=profiler_definition(ctx.profiler_kind).mcp_name,
-    )
-    progress_location = issue_board.display_path(progress_path, ctx.workspace)
-    profiler_artifact_path = issue_board.profiler_artifact_root(progress_path, round_number)
-    profiler_artifact_location = issue_board.display_path(
-        profiler_artifact_path, ctx.workspace
-    ).rstrip("/")
-    system_prompt += f"""
+def _profiler_campaign_context(progress_location: str, profiler_artifact_location: str) -> str:
+    """The campaign-context and read-only boundary block every profiler prompt ends with."""
+    return f"""
 
 ## Recent campaign context
 
@@ -832,41 +767,99 @@ capability mismatch; a later Implementer may add reviewed instrumentation.
 Write bounded durable profile evidence only below
 `{profiler_artifact_location}/`; keep large transient traces under `/tmp`.
 """
-    spec = profiler_mcp_spec(ctx.profiler_kind)
-    try:
-        summary = _invoke_read_only_role(
+
+
+def _run_profiler(
+    ctx: LoopContext,
+    request: LoopRunRequest,
+    progress: RoundProgress,
+    profile_focus: str,
+    progress_path: Path,
+) -> ProfilerSummary | None:
+    """Run one profiling pass: the bundle-declared command when selected, else the built-in kind."""
+    bundle = request.input_bundle
+    round_number = progress.round_number
+    domain_definition = resolve_domain(bundle.domain)
+    modality = request.modality
+    if modality is None and bundle.domain is constants.DomainName.LLM_SERVING:
+        modality = "text_generation"
+    prompt_kwargs: dict[str, object] = {
+        "profile_focus": profile_focus,
+        "benchmark_command": ctx.profiler_benchmark_command,
+        "modality": modality,
+        "domain_profiler": render_domain_section(
+            domain_definition,
+            DomainRole.PROFILER,
+            **_domain_render_context(ctx, modality, request.interface),
+        ),
+        "runtime_notes": ctx.run_environment_view.prompt_notes,
+        "objective": request.objective or bundle.objective,
+    }
+    profiler_artifact_path = issue_board.profiler_artifact_root(progress_path, round_number)
+    profiler_artifact_location = issue_board.display_path(
+        profiler_artifact_path, ctx.workspace
+    ).rstrip("/")
+    campaign_context = _profiler_campaign_context(
+        issue_board.display_path(progress_path, ctx.workspace), profiler_artifact_location
+    )
+    round_label = f"round-{round_number}-profiler"
+    invoke = functools.partial(
+        _invoke_read_only_role,
+        ctx,
+        role="profiler",
+        checkpoint_label=f"round-{round_number}-profiler-input",
+        allowed_workspace_paths=(profiler_artifact_location,),
+    )
+    if ctx.custom_profiler is not None:
+        # The command runs before the read-only wrapper and writes only under
+        # the artifact root; the wrapper guards the interpretation turn.
+        summary = custom_profiler_summary(
             ctx,
-            role="profiler",
-            checkpoint_label=f"round-{round_number}-profiler-input",
-            allowed_workspace_paths=(profiler_artifact_location,),
-            kind="profiler",
-            system_prompt=system_prompt,
-            user_prompt=(
-                "Profile the server and return exactly one JSON object matching the schema above."
+            CustomProfilerRun(
+                command=ctx.custom_profiler,
+                artifact_root=profiler_artifact_path,
+                round_label=round_label,
             ),
-            response_cls=ProfilerSummary,
-            fallback_factory=lambda: ProfilerSummary(
-                analysis="Profiler produced no structured response.",
-                bottlenecks="n/a",
-                suggestions="Re-run profiling on the next round.",
-                perf_metric=None,
-                perf_unit=None,
+            system_prompt=lambda capture: (
+                render_template(
+                    CUSTOM_PROFILER_TEMPLATE,
+                    template_dir=_TEMPLATE_DIR,
+                    **prompt_kwargs,
+                    **custom_profiler_prompt_context(capture),
+                )
+                + campaign_context
             ),
-            round_label=f"round-{round_number}-profiler",
-            mcp_servers=[spec] if spec is not None else None,
+            invoke=invoke,
         )
-    except Exception as exc:  # noqa: BLE001  # lint-waiver: LW-010254 [BLE001]; configured profiler failures become framework warnings so candidate execution can continue.
-        output_sink().framework_warning(
-            "profiler failed",
-            detail=str(exc),
-            source=FrameworkSource.LOOP,
-            round_label=f"round-{round_number}",
+    else:
+        definition = effective_profiler_definition(
+            ctx.profiler_kind,
+            supports_torch_profiler=domain_definition.supports_torch_profiler,
         )
-        return None
+        turn = ProfilerTurn(
+            system_prompt=render_template(
+                definition.prompt_template,
+                template_dir=_TEMPLATE_DIR,
+                **prompt_kwargs,
+                profile_execution=ctx.run_environment_view.profile_execution,
+                profiler_support_name=definition.support_name,
+                profiler_mcp_name=definition.mcp_name,
+            )
+            + campaign_context,
+            round_label=round_label,
+        )
+        spec = profiler_mcp_spec(ctx.profiler_kind)
+        try:
+            summary = invoke_profiler_agent(
+                ctx, turn, mcp_servers=[spec] if spec is not None else None, invoke=invoke
+            )
+        except Exception as exc:  # noqa: BLE001  # lint-waiver: LW-010254 [BLE001]; configured profiler failures become framework warnings so candidate execution can continue.
+            warn_profiler_failed(exc, round_label=f"round-{round_number}")
+            return None
     if summary is None:
         return None
     issue_board.append_profiler_summary(progress_path, round_number, summary)
-    ctx.snapshot_workspace(f"round-{round_number}-profiler")
+    ctx.snapshot_workspace(round_label)
     return summary
 
 
@@ -1691,7 +1684,7 @@ def _run_single_agent_round(
         **_domain_render_context(ctx, modality, interface),
     )
     effective_profiler = (
-        _effective_profiler_definition(
+        effective_profiler_definition(
             ctx.profiler_kind,
             supports_torch_profiler=domain_definition.supports_torch_profiler,
         )
@@ -2372,7 +2365,7 @@ def _plan_agent_round(
                 carry=carry,
                 has_history=not _is_fresh_cold_start(round_number, engine.state.rounds),
             )
-            if pre_decision.need_profile and ctx.profiler_kind is not ProfilerKind.NONE:
+            if pre_decision.need_profile and ctx.profiler_enabled:
                 profiler_summary = _run_profiler(
                     ctx,
                     request,
@@ -3293,6 +3286,7 @@ def _create_agent_run_context(
         debug=request.debug,
         profiler_kind=request.profiler_kind,
         profiler_domain=domain_definition.name,
+        custom_profiler=declared_custom_profiler(bundle),
         skills_dirs=request.skills_dirs,
         run_environment=run_environment,
         agent_backend=request.agent_backend,

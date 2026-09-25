@@ -28,10 +28,12 @@ if TYPE_CHECKING:
 # assignment such as ``kind = "migrant"``, which ruff formats with spaces.
 _KIND_KWARG = re.compile(r'\bkind="(\w+)"')
 
-# ``invoke_profiler`` (vibesys.loops.profiler) wraps ``ctx.invoke(kind="profiler", ...)``
-# without spelling the literal out at its call sites, so a call to it implies
-# the "profiler" role.
-_INVOKE_PROFILER_CALL = re.compile(r"\binvoke_profiler\(")
+# The ``vibesys.loops.profiler`` entry points wrap ``ctx.invoke(kind="profiler", ...)``
+# without spelling the literal out at their call sites, so a call to any of
+# them implies the "profiler" role.
+_INVOKE_PROFILER_CALL = re.compile(
+    r"\b(?:invoke_profiler|invoke_profiler_agent|custom_profiler_summary|interpret_custom_profiler)\("
+)
 
 _LOOP_PACKAGES: dict[str, ModuleType] = {
     "agent": agent_package,

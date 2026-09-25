@@ -63,9 +63,16 @@ from vibesys.loops.gates import (
     FrameworkBenchmarkOutcome,
 )
 from vibesys.loops.metrics import MetricSpace, Objective
-from vibesys.profilers import ProfilerKind
+from vibesys.profilers import CustomProfilerCommand, ProfilerKind
 from vibesys.render.sink import output_sink
-from vibesys.run import EventJournal, GitTracker, LoopContext, RunState, RunStateNamespace
+from vibesys.run import (
+    EXCLUDED_WORKSPACE_DIRS,
+    EventJournal,
+    GitTracker,
+    LoopContext,
+    RunState,
+    RunStateNamespace,
+)
 from vibesys.run.git_events import NullGitTrackerEvents
 from vibesys.sandbox.run_environment import (
     CandidateRuntime,
@@ -77,12 +84,14 @@ from vibesys.schemas import JudgeResponse, ProfilerSummary, Verdict
 from vs_agent.api import CandidateProgress, RoundProgress
 from vs_agent.api.testing import FakeAgentClient, FakeInvocation
 from vs_project.api import EvolveRunConfiguration, Project, RunEnvironmentRecord
+from vs_sandbox.api import LocalShellSandbox
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from vibesys.evaluators.input_manifest import WorkspaceSource
     from vibesys.loops.evolve.search_policy import SearchPolicyName
+    from vs_sandbox.api import SandboxExecutionResult
 
 from vibesys.run import RepositoryVisibility
 
@@ -182,6 +191,13 @@ class _FakeLoopContext(LoopContext):
     parameter type. Members a test does not wire up stay unset, so a helper
     that reaches past what the test set up fails loudly.
     """
+
+    custom_profiler: CustomProfilerCommand | None = None
+
+    @property
+    def profiler_enabled(self) -> bool:
+        """Mirror the real context's rule over the members a test wired up."""
+        return self.profiler_kind is not ProfilerKind.NONE or self.custom_profiler is not None
 
     def __init__(self, **options: Unpack[_FakeLoopContextOptions]) -> None:
         git = options.get("git")
@@ -1916,3 +1932,155 @@ def test_evolve_accuracy_gate_extends_timeout_by_environment_setup_allowance() -
         )
 
     assert gate.call_args.kwargs["timeout_seconds"] == 210
+
+
+# ---------------------------------------------------------------------------
+# Bundle-declared custom profiler command
+# ---------------------------------------------------------------------------
+#
+# The ``[profiler]`` command really executes: the CPU backend's local run
+# environment is an unconfined ``LocalShellSandbox`` rooted at the workspace,
+# the same path the evaluator gates use. Tests script it with ``python -c``.
+
+_PROFILE_DIR_MARKER = "VIBESYS_PROFILE_DIR="
+_ACCURACY_GATE_MARKER = "<accuracy gate>"
+_CUSTOM_SUMMARY = {
+    "analysis": "decode is launch-bound",
+    "bottlenecks": "1. kernel launches",
+    "suggestions": "capture a CUDA graph",
+    "perf_metric": 21.5,
+    "perf_unit": "tok/s",
+}
+_JSON_SUMMARY_SCRIPT = f"import json; print(json.dumps({_CUSTOM_SUMMARY!r}))"
+_PLAIN_CAPTURE_TEXT = "hot path: matmul 80%"
+_PLAIN_CAPTURE_SCRIPT = (
+    "import os, pathlib; "
+    "root = pathlib.Path(os.environ['VIBESYS_PROFILE_DIR']); "
+    f"root.joinpath('trace.txt').write_text({_PLAIN_CAPTURE_TEXT!r}); "
+    f"print({_PLAIN_CAPTURE_TEXT!r})"
+)
+
+
+def _declare_custom_profiler(ref_file: str, script: str) -> str:
+    """Append a ``[profiler]`` table that runs ``script`` through ``python -c``."""
+    manifest = Path(ref_file).parent / "vibesys.input.toml"
+    argv = json.dumps(["python", "-c", script])
+    manifest.write_text(manifest.read_text() + f"\n[profiler]\ncommand = {argv}\n")
+    return ref_file
+
+
+def _record_sandbox_commands(executed: list[str]) -> Callable[..., SandboxExecutionResult]:
+    """Wrap ``LocalShellSandbox.execute`` so a test sees every command it ran."""
+    original = LocalShellSandbox.execute
+
+    def _execute(
+        self: LocalShellSandbox, command: str, *, timeout: int | None = None
+    ) -> SandboxExecutionResult:
+        executed.append(command)
+        return original(self, command, timeout=timeout)
+
+    return _execute
+
+
+def _marking_accuracy_gate(executed: list[str]) -> MagicMock:
+    """A passing accuracy gate that records when it ran relative to sandbox commands."""
+
+    def _pass(*_args: object, **_kwargs: object) -> None:
+        executed.append(_ACCURACY_GATE_MARKER)
+
+    return MagicMock(side_effect=_pass)
+
+
+def test_custom_profiler_command_runs_after_the_gates_and_owns_fitness(
+    tmp_path: Path, ref_file: str
+) -> None:
+    """A ``[profiler]`` command runs through the judge backend once the gates
+    pass; a JSON ``ProfilerSummary`` on stdout is recorded without an agent turn."""
+    executed: list[str] = []
+    runner = FakeAgentClient()
+    with patch.object(LocalShellSandbox, "execute", _record_sandbox_commands(executed)):
+        result = _invoke_bootstrap(
+            tmp_path,
+            _declare_custom_profiler(ref_file, _JSON_SUMMARY_SCRIPT),
+            runner,
+            accuracy_gate=_marking_accuracy_gate(executed),
+            profiler_kind=ProfilerKind.AUTO,
+        )
+
+    assert result is True
+    profiler_commands = [command for command in executed if _PROFILE_DIR_MARKER in command]
+    assert len(profiler_commands) == 1
+    assert shlex.join(["python", "-c", _JSON_SUMMARY_SCRIPT]) in profiler_commands[0]
+    assert executed.index(_ACCURACY_GATE_MARKER) < executed.index(profiler_commands[0])
+    assert runner.calls_for("profiler") == []
+    seed = _load_population(tmp_path).all[0]
+    assert (seed.perf_metric, seed.perf_unit) == (21.5, "tok/s")
+
+
+def test_custom_profiler_text_capture_is_interpreted_without_mcp(
+    tmp_path: Path, ref_file: str
+) -> None:
+    """Plain-text output goes to one profiler agent turn, with no MCP servers,
+    whose prompt carries the captured text and the artifact the command wrote."""
+    runner = FakeAgentClient().enqueue("profiler", _profiler_response(33.0))
+
+    result = _invoke_bootstrap(
+        tmp_path,
+        _declare_custom_profiler(ref_file, _PLAIN_CAPTURE_SCRIPT),
+        runner,
+        profiler_kind=ProfilerKind.AUTO,
+    )
+
+    assert result is True
+    calls = runner.calls_for("profiler")
+    assert len(calls) == 1
+    assert not calls[0].mcp_servers
+    assert _PLAIN_CAPTURE_TEXT in calls[0].system_prompt
+    assert "trace.txt" in calls[0].system_prompt
+    assert _load_population(tmp_path).all[0].perf_metric == 33.0
+
+
+def test_profiler_none_skips_the_declared_custom_command(tmp_path: Path, ref_file: str) -> None:
+    executed: list[str] = []
+    runner = FakeAgentClient()
+    with patch.object(LocalShellSandbox, "execute", _record_sandbox_commands(executed)):
+        result = _invoke_bootstrap(
+            tmp_path,
+            _declare_custom_profiler(ref_file, _JSON_SUMMARY_SCRIPT),
+            runner,
+            profiler_kind=ProfilerKind.NONE,
+        )
+
+    assert result is True
+    assert not any(_PROFILE_DIR_MARKER in command for command in executed)
+    assert runner.calls_for("profiler") == []
+    assert _load_population(tmp_path).all[0].perf_metric is None
+
+
+def test_custom_profiler_artifacts_stay_out_of_candidate_commits(
+    tmp_path: Path, ref_file: str
+) -> None:
+    """The artifact root lives under a tracker-excluded directory, so the
+    snapshot taken right after profiling does not commit the capture."""
+    runner = FakeAgentClient().enqueue("profiler", _profiler_response(33.0))
+
+    result = _invoke_bootstrap(
+        tmp_path,
+        _declare_custom_profiler(ref_file, _PLAIN_CAPTURE_SCRIPT),
+        runner,
+        profiler_kind=ProfilerKind.AUTO,
+    )
+
+    assert result is True
+    project_dir = _project_dir(tmp_path)
+    artifacts = list(project_dir.rglob("trace.txt"))
+    assert len(artifacts) == 1
+    excluded_root = artifacts[0].relative_to(project_dir).parts[0]
+    assert excluded_root in EXCLUDED_WORKSPACE_DIRS
+    seed = _load_population(tmp_path).all[0]
+    assert seed.commit
+    tracker = GitTracker(project_dir, run_id="test-evolve", events=NullGitTrackerEvents())
+    tree = tracker.run(["git", "ls-tree", "-r", "--name-only", seed.commit]).stdout.decode()
+    committed = tree.split("\n")
+    assert not any(path.startswith(f"{excluded_root}/") for path in committed)
+    assert not any(path.endswith("trace.txt") for path in committed)

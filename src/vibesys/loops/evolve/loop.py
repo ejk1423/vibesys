@@ -68,11 +68,23 @@ from vibesys.loops.gates import (
     run_benchmark_gate,
 )
 from vibesys.loops.metrics import MetricSpace, Objective
-from vibesys.loops.profiler import invoke_profiler
-from vibesys.profilers import ProfilerKind, profiler_definition
+from vibesys.loops.profiler import (
+    CUSTOM_PROFILER_TEMPLATE,
+    CustomProfilerRun,
+    custom_profiler_prompt_context,
+    custom_profiler_summary,
+    declared_custom_profiler,
+    invoke_profiler,
+)
+from vibesys.profilers import profiler_definition
 from vibesys.prompts import PROMPTS_DIR
 from vibesys.render.sink import output_sink
-from vibesys.run import LocalRunIntegration, LoopContext, RunStateNamespace
+from vibesys.run import (
+    EXCLUDED_WORKSPACE_DIRS,
+    LocalRunIntegration,
+    LoopContext,
+    RunStateNamespace,
+)
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
     make_run_environment_spec,
@@ -89,6 +101,7 @@ _DEFAULT_CRITERIA = (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
     from vibesys.loops.request import LoopRunRequest
 _TEMPLATE_DIR = PROMPTS_DIR / "loops" / "evolve"
@@ -415,6 +428,38 @@ def _format_objectives_for_profiler(objectives: Sequence[Objective]) -> str:
     )
 
 
+def _pareto_profiler_addendum(space: MetricSpace) -> str:
+    """The Pareto-frontier addendum, or an empty string when no objectives are configured."""
+    if not space.objectives:
+        return ""
+    return _PARETO_PROFILER_ADDENDUM.format(
+        objective_list=_format_objectives_for_profiler(space.objectives),
+    )
+
+
+# Workspace directory that holds custom profiler captures. It is one of the
+# directories the Git tracker excludes, so the ``snapshot_workspace`` that
+# follows profiling never commits a capture into the candidate lineage.
+_PROFILE_ARTIFACT_DIR = ".cache"
+
+
+def _profile_artifact_root(ctx: LoopContext, *, generation: int, child_idx: int) -> Path:
+    """Where one candidate's custom profiler writes its artifacts (under the workspace)."""
+    if _PROFILE_ARTIFACT_DIR not in EXCLUDED_WORKSPACE_DIRS:
+        message = (
+            f"profile artifact directory {_PROFILE_ARTIFACT_DIR!r} is not excluded from "
+            "workspace tracking; captures would be committed into candidates"
+        )
+        raise RuntimeError(message)
+    return (
+        ctx.workspace
+        / _PROFILE_ARTIFACT_DIR
+        / "profiles"
+        / f"gen-{generation:04d}"
+        / f"cand-{child_idx:02d}"
+    )
+
+
 def _run_profiler(
     ctx: LoopContext,
     *,
@@ -422,19 +467,15 @@ def _run_profiler(
     progress: CandidateProgress,
     runtime_notes: str | None = None,
 ) -> ProfilerSummary | None:
+    if not ctx.profiler_enabled:
+        return None
     generation = progress.round_number
     child_idx = progress.candidate_number
-    objective = _required_evolve_objective(request)
-    space = request.space
     bundle = request.input_bundle
     modality = request.modality
     domain_definition = resolve_domain(bundle.domain)
     if modality is None and domain_definition.name is DomainName.LLM_SERVING:
         modality = "text_generation"
-    if ctx.profiler_kind is ProfilerKind.NONE:
-        return None
-    definition = profiler_definition(ctx.profiler_kind)
-    template = definition.prompt_template
     prompt_runtime_notes = (
         runtime_notes if runtime_notes is not None else ctx.run_environment_view.prompt_notes
     )
@@ -443,30 +484,55 @@ def _run_profiler(
         DomainRole.PROFILER,
         **_domain_render_context(ctx, modality, runtime_notes=prompt_runtime_notes),
     )
-    base_prompt = _render(
-        template,
-        benchmark_command=ctx.profiler_benchmark_command,
-        modality=modality,
-        interface=_INTERFACE,
-        domain_profiler=domain_profiler,
-        runtime_notes=prompt_runtime_notes,
-        profile_execution=ctx.run_environment_view.profile_execution,
-        objective=objective,
-        profile_focus="Measure the headline metric for this candidate; rank top kernel-level bottlenecks.",
-        profiler_support_name=definition.support_name,
-        profiler_mcp_name=definition.mcp_name,
-    )
-    if space.objectives:
-        addendum = _PARETO_PROFILER_ADDENDUM.format(
-            objective_list=_format_objectives_for_profiler(space.objectives),
+    shared_kwargs: dict[str, object] = {
+        "benchmark_command": ctx.profiler_benchmark_command,
+        "modality": modality,
+        "domain_profiler": domain_profiler,
+        "runtime_notes": prompt_runtime_notes,
+        "objective": _required_evolve_objective(request),
+        "profile_focus": (
+            "Measure the headline metric for this candidate; rank top kernel-level bottlenecks."
+        ),
+    }
+    addendum = _pareto_profiler_addendum(request.space)
+    round_label = f"gen-{generation}-cand-{child_idx}-profiler"
+    if ctx.custom_profiler is not None:
+        return custom_profiler_summary(
+            ctx,
+            CustomProfilerRun(
+                command=ctx.custom_profiler,
+                artifact_root=_profile_artifact_root(
+                    ctx, generation=generation, child_idx=child_idx
+                ),
+                round_label=round_label,
+                fallback_suggestions="n/a",
+            ),
+            system_prompt=lambda capture: (
+                _render(
+                    CUSTOM_PROFILER_TEMPLATE,
+                    **shared_kwargs,
+                    **custom_profiler_prompt_context(capture),
+                )
+                + addendum
+            ),
         )
-        system_prompt = base_prompt + addendum
-    else:
-        system_prompt = base_prompt
+    # ``profiler_enabled`` without a custom command means a built-in kind.
+    definition = profiler_definition(ctx.profiler_kind)
+    system_prompt = (
+        _render(
+            definition.prompt_template,
+            **shared_kwargs,
+            interface=_INTERFACE,
+            profile_execution=ctx.run_environment_view.profile_execution,
+            profiler_support_name=definition.support_name,
+            profiler_mcp_name=definition.mcp_name,
+        )
+        + addendum
+    )
     return invoke_profiler(
         ctx,
         system_prompt=system_prompt,
-        round_label=f"gen-{generation}-cand-{child_idx}-profiler",
+        round_label=round_label,
         fallback_suggestions="n/a",
     )
 
@@ -1648,6 +1714,7 @@ def _create_evolve_context(
         existing=existing,
         debug=debug,
         profiler_kind=profiler_kind,
+        custom_profiler=declared_custom_profiler(bundle),
         profiler_domain=domain_definition.name,
         skills_dirs=skills_dirs,
         run_environment=run_environment,

@@ -16,7 +16,13 @@ candidate source, reading only enough to judge whether measurement would change
 the first plan.
 {% endif %}
 
-{% if profiler_kind|default('none') == 'none' %}
+{% if custom_profiler_command|default(none) %}
+The framework runs the task's own profiler command
+(`{{ custom_profiler_command }}`) and hands its output to the profiler agent.
+Request only evidence that command can produce. Do not request a different
+profiler. Treat this declared capability as authoritative; do not audit the
+command or design new capture infrastructure in this phase.
+{% elif profiler_kind|default('none') == 'none' %}
 Standalone profiling is disabled. Set `need_profile=false`; record any missing
 visibility as uncertainty for the design call rather than requesting capture.
 {% else %}

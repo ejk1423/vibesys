@@ -383,6 +383,12 @@ defaults, and is one-way.
 `--modal --profiler nsys` is rejected by the CLI because Modal runs must use the
 torch profiler path.
 
+A task can also declare its own profiler in `vibesys.input.toml` (see the
+`[profiler]` table under [Target Inputs](#target-inputs)). Precedence:
+`--profiler auto` runs the declared command and skips the built-in kinds; an
+explicit built-in kind ignores the declaration and logs one framework warning;
+`--profiler none` disables both.
+
 Profiler prompts must match the interface, domain, and backend. In-process
 execution alone does not make the candidate Python or PyTorch-compatible; the
 selected domain must explicitly support Torch profiling. A CPU backend must not
@@ -599,6 +605,17 @@ contain exactly one field with that name. Omit the result block for
 multi-profile or multi-objective benchmarks whose result cannot be represented
 by one scalar. Named profiles and benchmark parameter schemas are not part of
 manifest version 1.
+
+The optional `[profiler]` table declares a task-owned profiler command with the
+same `command` or `entrypoint`/`args` shape and optional `timeout_seconds`. It
+runs from the repository root through the same trust boundary as `[benchmark]`,
+after the candidate's gates pass, with `VIBESYS_PROFILE_DIR` set to a
+workspace-relative directory for durable artifacts. If stdout, or
+`$VIBESYS_PROFILE_DIR/summary.json`, is a JSON `ProfilerSummary` object it is
+used directly without an agent turn; any other output is handed to the
+profiler agent to summarize; a failed or empty run yields no hints and the
+round continues. See [Profiler](#profiler) for how it interacts with
+`--profiler`.
 
 `benchmark.result_protocol` is the alternative, and the two are mutually
 exclusive. It declares that the benchmark speaks the evaluator result protocol

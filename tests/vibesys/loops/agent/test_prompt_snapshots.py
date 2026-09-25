@@ -524,6 +524,28 @@ def test_pre_round_prompt_disables_none_profiler_without_fake_capture_path() -> 
     assert "`remote` capture path" not in rendered
 
 
+def test_pre_round_prompt_describes_a_declared_custom_profiler_command() -> None:
+    """A bundle-declared command runs with ``profiler_kind='none'``, so its branch
+    must win over the disabled branch or the orchestrator would never ask."""
+    rendered = render_template(
+        "orchestrator_pre_round_prompt.j2",
+        template_dir=_TEMPLATE_DIR,
+        objective_location="OBJECTIVE.md",
+        regression_info=None,
+        exhaustion_info=None,
+        progress_location="progress/",
+        profiler_kind="none",
+        custom_profiler_command="bin/prof.sh --fast",
+        profile_execution="local",
+    )
+
+    assert "runs the task's own profiler command" in rendered
+    assert "`bin/prof.sh --fast`" in rendered
+    assert "Do not request a different\nprofiler" in rendered
+    assert "Standalone profiling is disabled" not in rendered
+    assert "`none` profiling" not in rendered
+
+
 def test_official_evaluation_due_changes_agent_measurement_contract() -> None:
     context = _CONTEXTS["full"] | {
         "official_evaluation_due": True,
