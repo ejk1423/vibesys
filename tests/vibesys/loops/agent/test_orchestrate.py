@@ -4882,6 +4882,64 @@ def test_loop_explicit_builtin_profiler_ignores_the_declared_command(
     assert "`headroom` profiling through" in pre_round.system_prompt
 
 
+def _single_agent_custom_profiler_location(tmp_path: Path) -> str:
+    """Round 1's profiler artifact root as the single-agent prompt names it."""
+    project = _created_project(tmp_path)
+    progress_path = issue_board.resolve_paths(project, "files")[1]
+    return issue_board.display_path(
+        issue_board.profiler_artifact_root(progress_path, 1), project
+    ).rstrip("/")
+
+
+def test_single_agent_prompt_names_the_declared_custom_profiler_command(
+    tmp_path: Path, ref_file: Path
+) -> None:
+    """With no profiler agent, the single agent is told to run the command itself."""
+    display = _declare_custom_profiler(ref_file, structured=True)
+    fake = _new_orchestrate_fake()
+    fake.enqueue("implementer", _single_agent_round(None))
+
+    result = _invoke_orchestrate(
+        tmp_path,
+        ref_file,
+        fake,
+        max_rounds=1,
+        inner_loop="single-agent",
+        profiler_kind=ProfilerKind.AUTO,
+    )
+
+    assert result is True
+    [implementer_call] = fake.calls_for("implementer")
+    location = _single_agent_custom_profiler_location(tmp_path)
+    assert f"`env VIBESYS_PROFILE_DIR={location} {display}`" in implementer_call.system_prompt
+    assert "Standalone profiling is disabled" not in implementer_call.system_prompt
+    assert "Record `observer_effect_fraction`" in implementer_call.system_prompt
+
+
+def test_single_agent_prompt_keeps_an_explicit_builtin_profiler(
+    tmp_path: Path, ref_file: Path
+) -> None:
+    """An explicit built-in ``--profiler`` shadows the declared command here too."""
+    display = _declare_custom_profiler(ref_file, structured=True)
+    fake = _new_orchestrate_fake()
+    fake.enqueue("implementer", _single_agent_round(None))
+
+    result = _invoke_orchestrate(
+        tmp_path,
+        ref_file,
+        fake,
+        max_rounds=1,
+        inner_loop="single-agent",
+        profiler_kind=ProfilerKind.HEADROOM,
+    )
+
+    assert result is True
+    [implementer_call] = fake.calls_for("implementer")
+    assert display not in implementer_call.system_prompt
+    assert "VIBESYS_PROFILE_DIR" not in implementer_call.system_prompt
+    assert "for the scoped capture" in implementer_call.system_prompt
+
+
 def test_loop_generic_auto_profiler_resolves_to_macos_cpu(tmp_path: Path, ref_file: Path) -> None:
     fake = _new_orchestrate_fake()
     fake.enqueue(

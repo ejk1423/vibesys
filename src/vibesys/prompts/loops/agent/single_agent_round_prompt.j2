@@ -73,7 +73,13 @@ Profile only a decision-relevant gap from the typed plan. Prefer the configured
 profiler and existing support path. Record an uninstrumented control, activation,
 observer effect, and non-overlapping evidence. Perturbed captures are qualitative;
 overlapping CPU/CUDA totals are not additive.
-{% if profiler_kind == 'none' %}
+{% if custom_profiler_command|default(none) %}
+Run the task's own profiler command for the scoped capture, from the repository root:
+`env VIBESYS_PROFILE_DIR={{ custom_profiler_artifact_location }} {{ custom_profiler_command }}`
+Create that directory first. If the command prints a JSON `ProfilerSummary` object
+or writes `summary.json` there, use it as the capture; otherwise interpret its
+output and artifact files yourself. Do not substitute a different profiler.
+{% elif profiler_kind == 'none' %}
 Standalone profiling is disabled for this run. Use existing evidence and do not
 invoke profiler tools.
 {% elif profiler_support_name == 'torch_profiler' %}
@@ -81,7 +87,7 @@ Use `torch.profiler` through `{{ profiler_support_name }}` for the scoped captur
 {% else %}
 Use `nsys` through `{{ profiler_support_name or 'nsys_profiler' }}` for the scoped capture.
 {% endif %}
-{% if profiler_kind != 'none' %}
+{% if profiler_kind != 'none' or custom_profiler_command|default(none) %}
 Record `observer_effect_fraction` against a comparable uninstrumented control.
 If headline metrics differ by more than 10%, the capture is qualitative and
 must not be converted into exclusive phase shares.

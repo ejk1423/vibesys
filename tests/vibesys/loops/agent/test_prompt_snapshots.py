@@ -201,7 +201,11 @@ def _render_prompt(domain: DomainName, role: str, context: dict[str, object]) ->
             pareto_archive_conflict=context.get("pareto_archive_conflict"),
         )
     if role == "single_agent":
-        profiler = profiler_definition(ProfilerKind.NSYS)
+        profiler_kind = context.get("profiler_kind", ProfilerKind.NSYS)
+        assert isinstance(profiler_kind, ProfilerKind)
+        profiler = (
+            profiler_definition(profiler_kind) if profiler_kind is not ProfilerKind.NONE else None
+        )
         return render_template(
             "single_agent_round_prompt.j2",
             template_dir=_TEMPLATE_DIR,
@@ -212,9 +216,11 @@ def _render_prompt(domain: DomainName, role: str, context: dict[str, object]) ->
             retry=context.get("retry", 1),
             feedback=context.get("feedback"),
             reference_path=context["reference_path"],
-            profiler_kind=ProfilerKind.NSYS,
-            profiler_support_name=profiler.support_name,
-            profiler_mcp_name=profiler.mcp_name,
+            profiler_kind=profiler_kind,
+            profiler_support_name=(profiler.support_name if profiler else None),
+            profiler_mcp_name=(profiler.mcp_name if profiler else None),
+            custom_profiler_command=context.get("custom_profiler_command"),
+            custom_profiler_artifact_location=context.get("custom_profiler_artifact_location"),
             domain_single_agent=_domain_section(domain, "single_agent", context),
             domain_profiler=_domain_section(domain, "profiler", context),
             benchmark_command=context["benchmark_command"],
@@ -544,6 +550,39 @@ def test_pre_round_prompt_describes_a_declared_custom_profiler_command() -> None
     assert "Do not request a different\nprofiler" in rendered
     assert "Standalone profiling is disabled" not in rendered
     assert "`none` profiling" not in rendered
+
+
+def test_single_agent_prompt_runs_a_declared_custom_profiler_command() -> None:
+    """The single agent has no profiler agent, so it runs the declared command
+    itself under the same ``VIBESYS_PROFILE_DIR`` contract the framework uses."""
+    context = _CONTEXTS["full"] | {
+        "profiler_kind": ProfilerKind.NONE,
+        "custom_profiler_command": "sh bin/prof.sh",
+        "custom_profiler_artifact_location": "progress/artifacts/profiles/round-0001",
+    }
+    rendered = _render_prompt(DomainName.LLM_SERVING, "single_agent", context)
+
+    assert "Run the task's own profiler command" in rendered
+    assert (
+        "`env VIBESYS_PROFILE_DIR=progress/artifacts/profiles/round-0001 sh bin/prof.sh`"
+        in rendered
+    )
+    assert "Do not substitute a different profiler" in rendered
+    assert "Standalone profiling is disabled" not in rendered
+    assert "Record `observer_effect_fraction`" in rendered
+
+
+def test_single_agent_prompt_disables_profiling_without_a_custom_command() -> None:
+    """``profiler_kind='none'`` alone still disables profiling and its control."""
+    rendered = _render_prompt(
+        DomainName.LLM_SERVING,
+        "single_agent",
+        _CONTEXTS["full"] | {"profiler_kind": ProfilerKind.NONE},
+    )
+
+    assert "Standalone profiling is disabled" in rendered
+    assert "VIBESYS_PROFILE_DIR" not in rendered
+    assert "Record `observer_effect_fraction`" not in rendered
 
 
 def test_official_evaluation_due_changes_agent_measurement_contract() -> None:

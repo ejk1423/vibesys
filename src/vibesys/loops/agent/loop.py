@@ -77,6 +77,7 @@ from vibesys.loops.agent.model import (
     Hypothesis,
     HypothesisResolution,
 )
+from vibesys.loops.agent.single_agent_profile import single_agent_profile_context
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.gates import (
     GATE_LOG_TAIL_CHARS,
@@ -106,7 +107,6 @@ from vibesys.loops.profiler import (
     warn_profiler_failed,
 )
 from vibesys.loops.profiler import mcp_spec as profiler_mcp_spec
-from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, render_template
 from vibesys.render.sink import output_sink
 from vibesys.run import LocalRunIntegration, LoopContext, RunStateNamespace
@@ -1683,14 +1683,6 @@ def _run_single_agent_round(
         DomainRole.PROFILER,
         **_domain_render_context(ctx, modality, interface),
     )
-    effective_profiler = (
-        effective_profiler_definition(
-            ctx.profiler_kind,
-            supports_torch_profiler=domain_definition.supports_torch_profiler,
-        )
-        if ctx.profiler_kind is not ProfilerKind.NONE
-        else None
-    )
     system_prompt = render_template(
         "single_agent_round_prompt.j2",
         template_dir=_TEMPLATE_DIR,
@@ -1718,9 +1710,12 @@ def _run_single_agent_round(
         plan_artifact_location=plan_artifact_location,
         recommended_skills=resolved_skills,
         profile_focus=profile_focus,
-        profiler_kind=ctx.profiler_kind,
-        profiler_support_name=(effective_profiler.support_name if effective_profiler else None),
-        profiler_mcp_name=(effective_profiler.mcp_name if effective_profiler else None),
+        **single_agent_profile_context(
+            ctx,
+            progress_path,
+            round_number,
+            supports_torch_profiler=domain_definition.supports_torch_profiler,
+        ),
         supports_torch_profiler=domain_definition.supports_torch_profiler,
         benchmark_command=ctx.judge_benchmark_command,
         accuracy_command=ctx.judge_accuracy_command,

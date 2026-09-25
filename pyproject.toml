@@ -173,7 +173,7 @@ roots = ["src", "libs", "scripts", "packaging", "sdk", "support"]
 [tool.vibesys.file_length.allowlist]
 # The agent loop: round orchestration, agent invocation, and result handling.
 # Candidate archive selection/rendering now lives in its own module.
-"src/vibesys/loops/agent/loop.py" = 3572
+"src/vibesys/loops/agent/loop.py" = 3567
 # Sandbox run environment: setup, execution, and teardown across strategies.
 # Semantic command-argument translation now lives in its own module.
 "src/vibesys/sandbox/run_environment.py" = 2150
