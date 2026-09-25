@@ -101,6 +101,51 @@ def test_synthesize_requires_both_benchmark_result_fields(tmp_path: Path) -> Non
         synthesize_input_bundle(_minimal_spec(benchmark_metric="latency_ms"), tmp_path / "bundle")
 
 
+def test_synthesize_profiler_command_and_timeout_round_trip(tmp_path: Path) -> None:
+    spec = _minimal_spec(
+        profiler_command=("python", "prof.py", "--fast"),
+        profiler_timeout_seconds=30,
+    )
+    root = synthesize_input_bundle(spec, tmp_path / "bundle")
+
+    manifest_text = (root / "vibesys.input.toml").read_text()
+    assert (
+        '[profiler]\ncommand = ["python", "prof.py", "--fast"]\ntimeout_seconds = 30\n'
+        in manifest_text
+    )
+    bundle = load_input_bundle(root)
+    assert bundle.manifest.profiler is not None
+    assert bundle.manifest.profiler.command == ("python", "prof.py", "--fast")
+    assert bundle.manifest.profiler.timeout_seconds == 30
+
+
+def test_synthesize_profiler_command_without_timeout_omits_timeout(tmp_path: Path) -> None:
+    root = synthesize_input_bundle(
+        _minimal_spec(profiler_command=("python", "prof.py")), tmp_path / "bundle"
+    )
+
+    manifest_text = (root / "vibesys.input.toml").read_text()
+    assert "[profiler]" in manifest_text
+    assert manifest_text.count("timeout_seconds") == 0
+    bundle = load_input_bundle(root)
+    assert bundle.manifest.profiler is not None
+    assert bundle.manifest.profiler.command == ("python", "prof.py")
+    assert bundle.manifest.profiler.timeout_seconds is None
+
+
+def test_synthesize_without_profiler_command_emits_no_profiler_table(tmp_path: Path) -> None:
+    root = synthesize_input_bundle(_minimal_spec(), tmp_path / "bundle")
+
+    assert "[profiler]" not in (root / "vibesys.input.toml").read_text()
+    assert load_input_bundle(root).manifest.profiler is None
+
+
+def test_synthesize_rejects_profiler_timeout_without_command(tmp_path: Path) -> None:
+    with pytest.raises(InputSynthesisError, match="requires --input-profiler-command"):
+        synthesize_input_bundle(_minimal_spec(profiler_timeout_seconds=30), tmp_path / "bundle")
+    assert not (tmp_path / "bundle").exists()
+
+
 def test_synthesize_refuses_existing_destination(tmp_path: Path) -> None:
     dest = tmp_path / "bundle"
     dest.mkdir()

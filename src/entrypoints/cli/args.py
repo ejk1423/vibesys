@@ -176,6 +176,22 @@ def _add_standalone_input_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     group.add_argument(
+        "--input-profiler-command",
+        default=None,
+        metavar="CMD",
+        help=(
+            "Optional task-owned profiler command, shell-quoted (e.g. 'python profile.py'); "
+            "written as [profiler].command and run under --profiler auto."
+        ),
+    )
+    group.add_argument(
+        "--input-profiler-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Optional timeout for the profiler command (requires --input-profiler-command).",
+    )
+    group.add_argument(
         "--input-reference",
         type=Path,
         default=None,

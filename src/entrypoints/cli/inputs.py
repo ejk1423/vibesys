@@ -145,6 +145,12 @@ def _synthesize_standalone_input(args: argparse.Namespace) -> Path:
         benchmark_timeout_seconds=args.input_benchmark_timeout,
         benchmark_metric=args.input_benchmark_metric,
         benchmark_result_arg=args.input_benchmark_result_arg,
+        profiler_command=(
+            _parse_command_flag(args.input_profiler_command, "--input-profiler-command")
+            if args.input_profiler_command is not None
+            else None
+        ),
+        profiler_timeout_seconds=args.input_profiler_timeout,
         reference_dir=args.input_reference,
         evaluator_dir=args.input_evaluator_dir,
         evaluator_source_dir=args.input_evaluator_source,

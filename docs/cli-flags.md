@@ -694,6 +694,8 @@ Optional flags:
 | --- | --- |
 | `--input-accuracy-timeout SECONDS` / `--input-benchmark-timeout SECONDS` | command `timeout_seconds` |
 | `--input-benchmark-metric NAME` + `--input-benchmark-result-arg OPT` | `[benchmark.result]` (both required together) |
+| `--input-profiler-command CMD` | `[profiler].command` (shell-quoted argv); runs under `--profiler auto` |
+| `--input-profiler-timeout SECONDS` | `[profiler].timeout_seconds` (requires `--input-profiler-command`) |
 | `--input-reference DIR` | copied to `reference/` |
 | `--input-evaluator-dir DIR` | contents copied into the bundle root (evaluator scripts the commands invoke) |
 | `--input-evaluator-source DIR` | `[evaluator].source` (staged inside the bundle) |

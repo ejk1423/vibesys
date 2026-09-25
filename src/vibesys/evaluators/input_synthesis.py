@@ -64,6 +64,11 @@ class InputSynthesisError(ValueError):
         )
 
     @classmethod
+    def profiler_timeout_without_command(cls) -> InputSynthesisError:
+        """Describe a profiler timeout given without the command it bounds."""
+        return cls("--input-profiler-timeout requires --input-profiler-command.")
+
+    @classmethod
     def reserved_entry_collision(cls, name: str) -> InputSynthesisError:
         """Describe evaluator contents that collide with a bundle-owned entry."""
         return cls(f"--input-evaluator-dir entry collides with a reserved bundle name: {name}")
@@ -95,6 +100,8 @@ class SynthesizedInputSpec:
     benchmark_timeout_seconds: int | None = None
     benchmark_metric: str | None = None
     benchmark_result_arg: str | None = None
+    profiler_command: tuple[str, ...] | None = None
+    profiler_timeout_seconds: int | None = None
     reference_dir: Path | None = None
     evaluator_dir: Path | None = None
     evaluator_source_dir: Path | None = None
@@ -125,6 +132,18 @@ def _require_source_dir(path: Path, label: str) -> Path:
     return resolved
 
 
+def _build_profiler_dict(spec: SynthesizedInputSpec) -> dict[str, object] | None:
+    """Assemble the optional ``[profiler]`` payload, rejecting a timeout with no command."""
+    if spec.profiler_command is None:
+        if spec.profiler_timeout_seconds is not None:
+            raise InputSynthesisError.profiler_timeout_without_command()
+        return None
+    profiler: dict[str, object] = {"command": list(spec.profiler_command)}
+    if spec.profiler_timeout_seconds is not None:
+        profiler["timeout_seconds"] = spec.profiler_timeout_seconds
+    return profiler
+
+
 def _build_manifest_dict(spec: SynthesizedInputSpec) -> dict[str, object]:
     """Assemble the manifest payload, mirroring the emitted TOML structure."""
     accuracy: dict[str, object] = {"command": list(spec.accuracy_command)}
@@ -148,6 +167,9 @@ def _build_manifest_dict(spec: SynthesizedInputSpec) -> dict[str, object]:
         "accuracy": accuracy,
         "benchmark": benchmark,
     }
+    profiler = _build_profiler_dict(spec)
+    if profiler is not None:
+        manifest["profiler"] = profiler
     if spec.evaluator_source_dir is not None:
         manifest["evaluator"] = {"source": EVALUATOR_SRC_DIRNAME}
     return manifest
@@ -183,6 +205,13 @@ def _render_manifest_toml(spec: SynthesizedInputSpec) -> str:
         lines.append("[benchmark.result]")
         lines.append(f"json_argument = {_toml_string(spec.benchmark_result_arg)}")
         lines.append(f"metric = {_toml_string(spec.benchmark_metric)}")
+        lines.append("")
+
+    if spec.profiler_command is not None:
+        lines.append("[profiler]")
+        lines.append(f"command = {_toml_string_array(spec.profiler_command)}")
+        if spec.profiler_timeout_seconds is not None:
+            lines.append(f"timeout_seconds = {spec.profiler_timeout_seconds}")
         lines.append("")
 
     if spec.evaluator_source_dir is not None:

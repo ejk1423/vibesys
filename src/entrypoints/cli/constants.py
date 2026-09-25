@@ -88,6 +88,8 @@ _STANDALONE_INPUT_DESTS = (
     "input_benchmark_timeout",
     "input_benchmark_metric",
     "input_benchmark_result_arg",
+    "input_profiler_command",
+    "input_profiler_timeout",
     "input_reference",
     "input_evaluator_dir",
     "input_evaluator_source",

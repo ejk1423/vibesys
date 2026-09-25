@@ -1820,6 +1820,56 @@ def test_bundle_declared_profiler_command_keeps_auto(tmp_path: Path) -> None:
     assert invocation.args.profiler is ProfilerKind.AUTO
 
 
+_SYNTHESIZED_INPUT_FLAGS = (
+    "--input-objective",
+    "Serve fast.",
+    "--input-domain",
+    "generic",
+    "--input-accuracy-command",
+    "python checker.py",
+    "--input-benchmark-command",
+    "python benchmark.py",
+    "--no-skills",
+)
+
+
+def test_synthesized_profiler_command_is_declared_and_keeps_auto(tmp_path: Path) -> None:
+    """``--input-profiler-*`` lands in ``[profiler]`` and ``auto`` yields to it."""
+
+    invocation = parse_cli_invocation(
+        [
+            *_SYNTHESIZED_INPUT_FLAGS,
+            "--input-profiler-command",
+            "python prof.py --fast",
+            "--input-profiler-timeout",
+            "30",
+            "--runs-dir",
+            str(tmp_path / "runs"),
+        ]
+    )
+
+    profiler = invocation.args.input_bundle.manifest.profiler
+    assert profiler is not None
+    assert profiler.command == ("python", "prof.py", "--fast")
+    assert profiler.timeout_seconds == 30
+    assert invocation.args.profiler is ProfilerKind.AUTO
+
+
+def test_synthesized_profiler_timeout_requires_command(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="requires --input-profiler-command") as exc:
+        parse_cli_invocation(
+            [
+                *_SYNTHESIZED_INPUT_FLAGS,
+                "--input-profiler-timeout",
+                "30",
+                "--runs-dir",
+                str(tmp_path / "runs"),
+            ]
+        )
+
+    assert exc.value.diagnostic.code == "invalid_input"
+
+
 def test_uninstrumented_microservice_task_keeps_auto(tmp_path: Path) -> None:
     """Without a collector there is nothing for the OTel profiler to read."""
 
