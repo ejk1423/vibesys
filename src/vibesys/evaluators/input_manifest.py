@@ -318,6 +318,7 @@ class InputManifest(BaseModel):
     profile_guided: ProfileGuidedInput | None = None
     accuracy: InputCommand
     benchmark: BenchmarkCommand
+    profiler: InputCommand | None = None
     resources: RunResourceRequest | None = None
     environment: EnvironmentInput | None = None
     workspace: WorkspaceInput | None = None
@@ -325,8 +326,9 @@ class InputManifest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_cross_references(self) -> InputManifest:
+        commands = (self.accuracy, self.benchmark, self.profiler)
         uses_entrypoint = any(
-            command.entrypoint is not None for command in (self.accuracy, self.benchmark)
+            command is not None and command.entrypoint is not None for command in commands
         )
         package = self.evaluator.package_requirement if self.evaluator is not None else None
         if uses_entrypoint and package is None:
@@ -371,6 +373,7 @@ def render_input_manifest(manifest: InputManifest) -> str:
     _append_accuracy(lines, manifest)
     _append_environment_and_resources(lines, manifest)
     _append_benchmark(lines, manifest)
+    _append_profiler(lines, manifest)
     _append_workspace_sources(lines, manifest)
     _append_evaluator(lines, manifest)
     return "\n".join(lines) + "\n"
@@ -391,23 +394,25 @@ def _append_profile_guided(lines: list[str], manifest: InputManifest) -> None:
         )
 
 
-def _append_accuracy(lines: list[str], manifest: InputManifest) -> None:
-    lines.extend(["", "[accuracy]"])
-    if manifest.accuracy.command is not None:
-        lines.append(f"command = {_toml_array(manifest.accuracy.command)}")
+def _append_input_command(lines: list[str], table: str, command: InputCommand) -> None:
+    """Emit one ``[<table>]`` command table (argv or entrypoint/args, timeout)."""
+    lines.extend(["", f"[{table}]"])
+    if command.command is not None:
+        lines.append(f"command = {_toml_array(command.command)}")
     else:
-        accuracy_entrypoint = _required_manifest_text(
-            manifest.accuracy.entrypoint,
-            "accuracy.entrypoint",
-        )
+        entrypoint = _required_manifest_text(command.entrypoint, f"{table}.entrypoint")
         lines.extend(
             [
-                f"entrypoint = {_toml_string(accuracy_entrypoint)}",
-                f"args = {_toml_array(manifest.accuracy.args)}",
+                f"entrypoint = {_toml_string(entrypoint)}",
+                f"args = {_toml_array(command.args)}",
             ]
         )
-    if manifest.accuracy.timeout_seconds is not None:
-        lines.append(f"timeout_seconds = {manifest.accuracy.timeout_seconds}")
+    if command.timeout_seconds is not None:
+        lines.append(f"timeout_seconds = {command.timeout_seconds}")
+
+
+def _append_accuracy(lines: list[str], manifest: InputManifest) -> None:
+    _append_input_command(lines, "accuracy", manifest.accuracy)
 
 
 def _append_environment_and_resources(lines: list[str], manifest: InputManifest) -> None:
@@ -435,27 +440,7 @@ def _append_environment_and_resources(lines: list[str], manifest: InputManifest)
 
 
 def _append_benchmark(lines: list[str], manifest: InputManifest) -> None:
-    lines.extend(
-        [
-            "",
-            "[benchmark]",
-        ]
-    )
-    if manifest.benchmark.command is not None:
-        lines.append(f"command = {_toml_array(manifest.benchmark.command)}")
-    else:
-        benchmark_entrypoint = _required_manifest_text(
-            manifest.benchmark.entrypoint,
-            "benchmark.entrypoint",
-        )
-        lines.extend(
-            [
-                f"entrypoint = {_toml_string(benchmark_entrypoint)}",
-                f"args = {_toml_array(manifest.benchmark.args)}",
-            ]
-        )
-    if manifest.benchmark.timeout_seconds is not None:
-        lines.append(f"timeout_seconds = {manifest.benchmark.timeout_seconds}")
+    _append_input_command(lines, "benchmark", manifest.benchmark)
     if manifest.benchmark.result is not None:
         lines.extend(
             [
@@ -465,6 +450,11 @@ def _append_benchmark(lines: list[str], manifest: InputManifest) -> None:
                 f"metric = {_toml_string(manifest.benchmark.result.metric)}",
             ]
         )
+
+
+def _append_profiler(lines: list[str], manifest: InputManifest) -> None:
+    if manifest.profiler is not None:
+        _append_input_command(lines, "profiler", manifest.profiler)
 
 
 def _append_workspace_sources(lines: list[str], manifest: InputManifest) -> None:
@@ -533,6 +523,7 @@ class InputBundle(BaseModel):
     evaluator_package_root: Path | None = None
     resolved_accuracy_command: tuple[str, ...]
     resolved_benchmark_command: tuple[str, ...]
+    resolved_profiler_command: tuple[str, ...] | None = None
     manifest: InputManifest
 
     @property
@@ -564,6 +555,13 @@ class InputBundle(BaseModel):
     def benchmark_command_display(self) -> str:
         """Render the configured benchmark command for user-facing output."""
         return self.manifest.benchmark.display(resolved_command=self.resolved_benchmark_command)
+
+    @property
+    def profiler_command_display(self) -> str | None:
+        """Render the optional advisory profiler command, or None when undeclared."""
+        if self.manifest.profiler is None:
+            return None
+        return self.manifest.profiler.display(resolved_command=self.resolved_profiler_command)
 
     @property
     def benchmark_result(self) -> BenchmarkResult | None:
@@ -641,7 +639,9 @@ def _load_input_bundle(
     manifest_path, objective_path = _input_bundle_paths(bundle_root, task_directory)
     manifest = _read_input_manifest(manifest_path, objective_path)
     _validate_modal_entrypoint(root, manifest)
-    evaluator_package, resolved_commands = _resolve_evaluator_commands(root, manifest)
+    evaluator_package, resolved_commands, resolved_profiler = _resolve_evaluator_commands(
+        root, manifest
+    )
     reference_path = _resolve_reference_path(bundle_root, task_directory)
     evaluator_path = _resolve_evaluator_source_path(bundle_root, task_directory, manifest)
 
@@ -660,6 +660,7 @@ def _load_input_bundle(
         evaluator_package_root=(evaluator_package.root if evaluator_package is not None else None),
         resolved_accuracy_command=resolved_commands[0],
         resolved_benchmark_command=resolved_commands[1],
+        resolved_profiler_command=resolved_profiler,
         manifest=manifest,
     )
 
@@ -724,7 +725,8 @@ def _validate_modal_entrypoint(root: Path, manifest: InputManifest) -> None:
 def _resolve_evaluator_commands(
     root: Path,
     manifest: InputManifest,
-) -> tuple[ResolvedEvaluatorPackage | None, list[tuple[str, ...]]]:
+) -> tuple[ResolvedEvaluatorPackage | None, list[tuple[str, ...]], tuple[str, ...] | None]:
+    """Resolve the required accuracy/benchmark argv plus the optional profiler argv."""
     requirement = manifest.evaluator.package_requirement if manifest.evaluator is not None else None
     evaluator_package = resolve_evaluator_package(requirement) if requirement is not None else None
     commands = [
@@ -734,7 +736,12 @@ def _resolve_evaluator_commands(
             ("benchmark.command", manifest.benchmark),
         )
     ]
-    return evaluator_package, commands
+    profiler = (
+        _resolve_evaluator_command(root, "profiler.command", manifest.profiler, evaluator_package)
+        if manifest.profiler is not None
+        else None
+    )
+    return evaluator_package, commands, profiler
 
 
 def _resolve_evaluator_command(

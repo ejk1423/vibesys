@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -14,6 +15,7 @@ from vibesys.evaluators.input_manifest import (
     InputManifest,
     WorkspaceSource,
     load_input_bundle,
+    render_input_manifest,
 )
 
 if TYPE_CHECKING:
@@ -150,6 +152,65 @@ def test_manifest_rejects_inconsistent_cross_references(
         InputManifest.model_validate(_manifest(overrides))
 
 
+def test_manifest_profiler_is_optional_and_parses_to_input_command() -> None:
+    assert InputManifest.model_validate(_manifest({})).profiler is None
+
+    manifest = InputManifest.model_validate(
+        _manifest({"profiler": {"command": ["python", "profile.py"], "timeout_seconds": 60}})
+    )
+
+    assert manifest.profiler == InputCommand(command=("python", "profile.py"), timeout_seconds=60)
+
+
+@pytest.mark.parametrize(
+    ("profiler", "message"),
+    [
+        ({"command": []}, r"profiler\.command"),
+        ({"command": ["python"], "entrypoint": "prof"}, r"profiler\n"),
+        ({"command": ["python"], "timeout_seconds": 0}, r"profiler\.timeout_seconds"),
+        ({"command": ["python"], "extra": 1}, r"profiler\.extra"),
+        ({"entrypoint": "prof"}, "evaluator entrypoints require a packaged"),
+    ],
+)
+def test_manifest_rejects_invalid_profiler_section(profiler: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        InputManifest.model_validate(_manifest({"profiler": profiler}))
+
+
+@pytest.mark.parametrize(
+    "profiler",
+    [
+        None,
+        {"command": ["python", "profile.py"]},
+        {"command": ["perf", "record", "-g"], "timeout_seconds": 120},
+    ],
+)
+def test_render_input_manifest_round_trips_profiler(profiler: dict[str, Any] | None) -> None:
+    manifest = InputManifest.model_validate(_manifest({"profiler": profiler}))
+
+    rendered = render_input_manifest(manifest)
+
+    assert InputManifest.model_validate(tomllib.loads(rendered)) == manifest
+    assert ("[profiler]" in rendered) is (profiler is not None)
+
+
+def test_render_input_manifest_round_trips_profiler_entrypoint() -> None:
+    manifest = InputManifest.model_validate(
+        _manifest(
+            {
+                "evaluator": {"name": "pkg", "version": "1.0"},
+                "accuracy": {"entrypoint": "check"},
+                "benchmark": {"entrypoint": "bench"},
+                "profiler": {"entrypoint": "prof", "args": ["--fast"], "timeout_seconds": 5},
+            }
+        )
+    )
+
+    rendered = render_input_manifest(manifest)
+
+    assert InputManifest.model_validate(tomllib.loads(rendered)) == manifest
+
+
 _VALID_TOML = """version = 1
 [agent]
 domain = "generic"
@@ -215,6 +276,60 @@ def test_load_input_bundle_rejects_bad_executables(
     _bundle(tmp_path, benchmark)
     with pytest.raises(error, match=message):
         load_input_bundle(tmp_path)
+
+
+def test_load_input_bundle_without_profiler_leaves_it_unset(tmp_path: Path) -> None:
+    bundle = load_input_bundle(_bundle(tmp_path))
+
+    assert bundle.manifest.profiler is None
+    assert bundle.resolved_profiler_command is None
+    assert bundle.profiler_command_display is None
+
+
+def test_load_input_bundle_resolves_profiler_command(tmp_path: Path) -> None:
+    _bundle(tmp_path)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "prof.sh").write_text("#!/bin/sh\n")
+    manifest = tmp_path / "vibesys.input.toml"
+    manifest.write_text(
+        manifest.read_text() + '[profiler]\ncommand = ["bin/prof.sh", "a b"]\ntimeout_seconds = 9\n'
+    )
+
+    bundle = load_input_bundle(tmp_path)
+
+    assert bundle.resolved_profiler_command == ("bin/prof.sh", "a b")
+    assert bundle.profiler_command_display == "bin/prof.sh 'a b'"
+    assert bundle.manifest.profiler is not None
+    assert bundle.manifest.profiler.timeout_seconds == 9
+
+
+@pytest.mark.parametrize(
+    ("profiler", "error", "message"),
+    [
+        ("/usr/bin/perf", ValueError, "profiler.command executable must be relative"),
+        ("../outside/prof.sh", ValueError, "profiler.command executable escapes the project"),
+        ("bin/missing.sh", FileNotFoundError, "profiler.command executable does not exist"),
+        ("bin/.", ValueError, "profiler.command executable is not a file"),
+    ],
+)
+def test_load_input_bundle_rejects_bad_profiler_executables(
+    tmp_path: Path, profiler: str, error: type[Exception], message: str
+) -> None:
+    (tmp_path / "bin").mkdir()
+    _bundle(tmp_path)
+    manifest = tmp_path / "vibesys.input.toml"
+    manifest.write_text(manifest.read_text() + f'[profiler]\ncommand = ["{profiler}"]\n')
+    with pytest.raises(error, match=message):
+        load_input_bundle(tmp_path)
+
+
+def test_load_input_bundle_names_profiler_path_in_manifest_error(tmp_path: Path) -> None:
+    _bundle(tmp_path)
+    manifest = tmp_path / "vibesys.input.toml"
+    manifest.write_text(manifest.read_text() + "[profiler]\ncommand = []\n")
+    with pytest.raises(ValueError, match=r"(?s)Invalid input manifest .*profiler\.command") as exc:
+        load_input_bundle(tmp_path)
+    assert isinstance(exc.value.__cause__, ValidationError)
 
 
 def test_load_input_bundle_rejects_reference_that_is_a_file(tmp_path: Path) -> None:
