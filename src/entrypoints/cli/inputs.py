@@ -214,10 +214,13 @@ def _apply_bundle_profiler_default(args: argparse.Namespace) -> None:
     provide. A benchmark command that emits a normalized telemetry report and a
     trace graph has provided exactly that, so honoring it here is what makes an
     instrumented task profile out of the box. An explicit ``--profiler`` always
-    wins: this only ever replaces ``auto``.
+    wins: this only ever replaces ``auto``. A bundle-declared ``[profiler]``
+    command is the more specific default, so ``auto`` keeps yielding to it.
     """
     bundle = getattr(args, "input_bundle", None)
     if bundle is None or getattr(args, "profiler", None) is not ProfilerKind.AUTO:
+        return
+    if bundle.manifest.profiler is not None:
         return
     if bundle.domain is not DomainName.MICROSERVICES:
         return

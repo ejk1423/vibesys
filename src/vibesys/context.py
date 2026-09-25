@@ -41,6 +41,7 @@ from vibesys.events import (
     CoreEventType,
     EventStatus,
     ExperimentsChangedData,
+    FrameworkSource,
     InvocationFinishedData,
     InvocationStartedData,
     PhaseData,
@@ -48,10 +49,13 @@ from vibesys.events import (
 )
 from vibesys.profilers import (
     ACTIVE_PROFILER_KINDS,
+    CustomProfilerCommand,
     ProfilerKind,
+    custom_profiler_overridden,
     preflight_profiler_kind,
     profiler_definition,
     resolve_profiler_kind,
+    select_custom_profiler,
 )
 from vibesys.render.log import log_and_print
 from vibesys.render.run_log import RunLogRenderer
@@ -257,6 +261,7 @@ class _RunContextOptions:
     debug: bool
     profiler_kind: ProfilerKind
     profiler_domain: DomainName
+    custom_profiler: CustomProfilerCommand | None
     skills_dirs: list[str] | None
     run_environment: RunEnvironmentSpec | None
     agent_backend: str | None
@@ -290,6 +295,7 @@ def create_run_context(  # noqa: PLR0913  # lint-waiver: LW-008202 [PLR0913]; th
     debug: bool = False,
     profiler_kind: ProfilerKind = ProfilerKind.AUTO,
     profiler_domain: DomainName = DomainName.LLM_SERVING,
+    custom_profiler: CustomProfilerCommand | None = None,
     skills_dirs: list[str] | None = None,
     run_environment: RunEnvironmentSpec | None = None,
     agent_backend: str | None = None,
@@ -333,6 +339,7 @@ def create_run_context(  # noqa: PLR0913  # lint-waiver: LW-008202 [PLR0913]; th
                 debug=debug,
                 profiler_kind=profiler_kind,
                 profiler_domain=profiler_domain,
+                custom_profiler=custom_profiler,
                 skills_dirs=skills_dirs,
                 run_environment=run_environment,
                 agent_backend=agent_backend,
@@ -385,6 +392,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-00
     debug = options.debug
     profiler_kind = options.profiler_kind
     profiler_domain = options.profiler_domain
+    custom_profiler = options.custom_profiler
     skills_dirs = options.skills_dirs
     run_environment = options.run_environment
     agent_backend = options.agent_backend
@@ -476,12 +484,25 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-00
                 model=model_name,
             )
         with boot_trace.span("profiler_preflight"):
-            resolved_profiler_kind = resolve_profiler_kind(
-                profiler_kind,
-                domain=profiler_domain,
-                backend_profiler_kind=getattr(backend_impl, "profiler_kind", None),
-                environment_default_profiler_kind=environment.default_profiler_kind,
-                environment_supported_profiler_kinds=environment.supported_profiler_kinds,
+            selected_custom = select_custom_profiler(profiler_kind, custom_profiler)
+            # Reported once the run log subscribes, so the warning is recorded.
+            ignored_custom = (
+                custom_profiler
+                if custom_profiler_overridden(profiler_kind, custom_profiler)
+                else None
+            )
+            # A bundle-declared command replaces built-in resolution. The
+            # checks below are for built-in kinds; ``none`` passes them all.
+            resolved_profiler_kind = (
+                ProfilerKind.NONE
+                if selected_custom is not None
+                else resolve_profiler_kind(
+                    profiler_kind,
+                    domain=profiler_domain,
+                    backend_profiler_kind=getattr(backend_impl, "profiler_kind", None),
+                    environment_default_profiler_kind=environment.default_profiler_kind,
+                    environment_supported_profiler_kinds=environment.supported_profiler_kinds,
+                )
             )
             supports_mcp_servers = cast(
                 "Callable[[AgentSpec], bool | None]", agent_driver_supports_mcp_servers
@@ -611,6 +632,15 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-00
             hook_log[0] = logger.lprint
             for message in buffered_logs:
                 logger.lprint(message)
+            if ignored_custom is not None:
+                output_sink().framework_warning(
+                    "custom profiler ignored",
+                    detail=(
+                        f"--profiler {profiler_kind.value} overrides the [profiler] command "
+                        f"declared by the input: {ignored_custom.command}"
+                    ),
+                    source=FrameworkSource.OTHER,
+                )
 
         paths = RunPaths(
             project_root=project_root,
@@ -998,6 +1028,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-00
             accuracy_command=accuracy_command,
             benchmark_command=benchmark_command,
             profiler_kind=resolved_profiler_kind,
+            custom_profiler=selected_custom,
             profiler_support_path=profiler_support_path,
             profiler_support_name=profiler_support_name,
             skill_source_paths=skill_source_paths,
@@ -1252,6 +1283,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # lint-waiver: LW-008207 [PLR
         accuracy_command=parent.accuracy_command,
         benchmark_command=parent.benchmark_command,
         profiler_kind=parent.profiler_kind,
+        custom_profiler=parent.custom_profiler,
         profiler_support_path=parent.profiler_support_path,
         profiler_support_name=parent.profiler_support_name,
         skill_source_paths=parent.skill_source_paths,
@@ -1313,6 +1345,7 @@ class _RunContext:
         accuracy_command: str,
         benchmark_command: str,
         profiler_kind: ProfilerKind,
+        custom_profiler: CustomProfilerCommand | None,
         profiler_support_path: str | None,
         profiler_support_name: str | None,
         skill_source_paths: list[Path],
@@ -1357,6 +1390,7 @@ class _RunContext:
         self.accuracy_command = accuracy_command
         self.benchmark_command = benchmark_command
         self.profiler_kind = profiler_kind
+        self.custom_profiler = custom_profiler
         self.profiler_support_path = profiler_support_path
         self.profiler_support_name = profiler_support_name
         self._skill_source_paths = skill_source_paths
@@ -1638,6 +1672,11 @@ class _RunContext:
     def judge_benchmark_command(self) -> str | None:
         """Return the benchmark command as seen by the judge agent."""
         return self.commands.judge_benchmark_command
+
+    @property
+    def profiler_enabled(self) -> bool:
+        """True when a built-in profiler kind or a bundle-declared profiler command will run."""
+        return self.profiler_kind is not ProfilerKind.NONE or self.custom_profiler is not None
 
     @property
     def profiler_support_agent_path(self) -> str | None:

@@ -18,14 +18,17 @@ from vibesys.macos_cpu_profiler import MacOSProfilerTool
 from vibesys.profilers import (
     ACTIVE_PROFILER_KINDS,
     PROFILER_DEFINITIONS,
+    CustomProfilerCommand,
     ProfilerDefinition,
     ProfilerKind,
     allowed_profiler_kinds,
     coerce_profiler_kind,
+    custom_profiler_overridden,
     preflight_profiler_kind,
     profiler_definition,
     require_domain_name,
     resolve_profiler_kind,
+    select_custom_profiler,
 )
 
 _DOMAINS = tuple(DomainName)
@@ -398,3 +401,58 @@ def test_macos_cpu_preflight_reports_tool_availability(
         "xctrace_path=missing",
         f"sample_path={sample_path or 'missing'}",
     )
+
+
+_CUSTOM = CustomProfilerCommand(command="python prof.py", timeout_seconds=30)
+
+
+def _expected_custom_selection(requested: ProfilerKind) -> tuple[bool, bool]:
+    """Return (selected, overridden) for a declared command under ``requested``.
+
+    Branches over every member so that a new kind is a test failure rather
+    than a silent default.
+    """
+    match requested:
+        case ProfilerKind.AUTO:
+            return True, False
+        case ProfilerKind.NONE:
+            return False, False
+        case (
+            ProfilerKind.NSYS
+            | ProfilerKind.OTEL
+            | ProfilerKind.TORCH
+            | ProfilerKind.NEURON
+            | ProfilerKind.MACOS_CPU
+            | ProfilerKind.LINUX_CPU
+            | ProfilerKind.HEADROOM
+        ):
+            return False, True
+    message = f"unhandled profiler kind {requested!r}"
+    raise AssertionError(message)
+
+
+@pytest.mark.parametrize("requested", _REQUESTED, ids=[kind.value for kind in _REQUESTED])
+def test_select_custom_profiler_only_yields_to_auto(requested: ProfilerKind) -> None:
+    selected, _ = _expected_custom_selection(requested)
+
+    assert select_custom_profiler(requested, _CUSTOM) == (_CUSTOM if selected else None)
+    assert select_custom_profiler(requested, None) is None
+
+
+@pytest.mark.parametrize("requested", _REQUESTED, ids=[kind.value for kind in _REQUESTED])
+def test_custom_profiler_overridden_only_by_explicit_built_in_kinds(
+    requested: ProfilerKind,
+) -> None:
+    _, overridden = _expected_custom_selection(requested)
+
+    assert custom_profiler_overridden(requested, _CUSTOM) is overridden
+    assert custom_profiler_overridden(requested, None) is False
+
+
+def test_custom_profiler_selection_and_override_are_exclusive() -> None:
+    """A declared command is selected, overridden, or disabled; never two at once."""
+    for requested in ProfilerKind:
+        selected = select_custom_profiler(requested, _CUSTOM) is not None
+        overridden = custom_profiler_overridden(requested, _CUSTOM)
+        assert not (selected and overridden)
+        assert (requested is ProfilerKind.NONE) == (not selected and not overridden)

@@ -35,9 +35,10 @@ from vibesys.evaluators import (
 )
 from vibesys.evaluators.input_manifest import WorkspaceSource
 from vibesys.evaluators.tools import CargoGitToolSpec
-from vibesys.events import CoreEventType
+from vibesys.events import CoreEvent, CoreEventType, FrameworkWarningData
 from vibesys.loops.agent.model import AgentRunState
-from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
+from vibesys.profilers import CustomProfilerCommand, ProfilerKind, ProfilerPreflightResult
+from vibesys.render.sink import output_sink
 from vibesys.run import (
     DeviceLease,
     LocalRunIntegration,
@@ -115,6 +116,8 @@ class _CreateContextOptions(TypedDict, total=False):
     remote_repo: str | None
     hooks: EnvironmentHooks | None
     integration: LocalRunIntegration | None
+    profiler_kind: ProfilerKind
+    custom_profiler: CustomProfilerCommand | None
 
 
 @pytest.fixture(autouse=True)
@@ -238,8 +241,9 @@ def _create_context(
         objective=options.get("objective", "Make the queue faster.\n"),
         existing=options.get("existing", False),
         project_configuration=options.get("configuration") or _configuration(),
-        profiler_kind=ProfilerKind.NONE,
+        profiler_kind=options.get("profiler_kind", ProfilerKind.NONE),
         profiler_domain=DomainName.GENERIC,
+        custom_profiler=options.get("custom_profiler"),
         run_environment=RunEnvironmentSpec("local"),
         agent_backend="stub",
         environment_hooks=options.get("hooks") or NoopEnvironmentHooks(),
@@ -804,6 +808,82 @@ def test_omnigent_accepts_active_profiler_configuration(tmp_path: Path) -> None:
         agent_state_model_type=AgentRunState,
     ) as context:
         assert context.profiler_kind is ProfilerKind.MACOS_CPU
+
+
+_CUSTOM_PROFILER = CustomProfilerCommand(command="python prof.py", timeout_seconds=30)
+
+
+def _framework_warnings(seen: list[CoreEvent]) -> list[FrameworkWarningData]:
+    return [
+        event.data
+        for event in seen
+        if event.type is CoreEventType.FRAMEWORK_WARNING
+        and isinstance(event.data, FrameworkWarningData)
+    ]
+
+
+def test_auto_profiler_yields_to_the_bundle_declared_command(tmp_path: Path) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        profiler_kind=ProfilerKind.AUTO,
+        custom_profiler=_CUSTOM_PROFILER,
+    ) as ctx:
+        assert ctx.profiler_kind is ProfilerKind.NONE
+        assert ctx.custom_profiler == _CUSTOM_PROFILER
+        assert ctx.profiler_enabled is True
+
+
+def test_explicit_profiler_overrides_the_declared_command_with_a_warning(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    seen: list[CoreEvent] = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        with _create_context(
+            project,
+            evaluator=evaluator,
+            profiler_kind=ProfilerKind.MACOS_CPU,
+            custom_profiler=_CUSTOM_PROFILER,
+        ) as ctx:
+            assert ctx.profiler_kind is ProfilerKind.MACOS_CPU
+            assert ctx.custom_profiler is None
+            assert ctx.profiler_enabled is True
+    finally:
+        unsubscribe()
+
+    [warning] = _framework_warnings(seen)
+    assert warning.summary == "custom profiler ignored"
+    assert warning.detail == (
+        "--profiler macos_cpu overrides the [profiler] command declared by the input: "
+        "python prof.py"
+    )
+
+
+def test_profiler_none_disables_the_declared_command_silently(tmp_path: Path) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    seen: list[CoreEvent] = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        with _create_context(
+            project,
+            evaluator=evaluator,
+            profiler_kind=ProfilerKind.NONE,
+            custom_profiler=_CUSTOM_PROFILER,
+        ) as ctx:
+            assert ctx.profiler_kind is ProfilerKind.NONE
+            assert ctx.custom_profiler is None
+            assert ctx.profiler_enabled is False
+    finally:
+        unsubscribe()
+
+    assert _framework_warnings(seen) == []
 
 
 def test_portable_state_snapshot_replaces_namespace_exactly(tmp_path: Path) -> None:

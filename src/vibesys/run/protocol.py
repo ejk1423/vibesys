@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from vibesys.constants import ComputeBackend
     from vibesys.evaluators.input_manifest import WorkspaceSource
-    from vibesys.profilers import ProfilerKind
+    from vibesys.profilers import CustomProfilerCommand, ProfilerKind
     from vibesys.run.event_journal import EventJournal
     from vibesys.run.git_tracker import GitTracker
     from vibesys.run.state import RunState
@@ -37,8 +37,14 @@ class LoopContext(Protocol):
     backend: ComputeBackend
     model_name: str
     profiler_kind: ProfilerKind
+    custom_profiler: CustomProfilerCommand | None
     ref_name: str
     workspace_sources: tuple[WorkspaceSource, ...]
+
+    @property
+    def profiler_enabled(self) -> bool:
+        """True when a built-in profiler kind or a bundle-declared profiler command will run."""
+        ...
 
     # -- collaborators --------------------------------------------------------
     events: EventJournal

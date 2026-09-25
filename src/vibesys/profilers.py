@@ -77,6 +77,34 @@ class ProfilerPreflightResult:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CustomProfilerCommand:
+    """A bundle-declared profiler command, as the input manifest resolved it."""
+
+    command: str
+    timeout_seconds: int | None
+
+
+def select_custom_profiler(
+    requested: ProfilerKind, declared: CustomProfilerCommand | None
+) -> CustomProfilerCommand | None:
+    """Pick the bundle-declared profiler command when ``--profiler`` allows it.
+
+    Only ``auto`` yields to a bundle-declared command. An explicit built-in
+    kind wins over the declaration, and ``none`` disables both.
+    """
+    if declared is None or requested is not ProfilerKind.AUTO:
+        return None
+    return declared
+
+
+def custom_profiler_overridden(
+    requested: ProfilerKind, declared: CustomProfilerCommand | None
+) -> bool:
+    """True when an explicit built-in ``--profiler`` shadows a declared command."""
+    return declared is not None and requested not in (ProfilerKind.AUTO, ProfilerKind.NONE)
+
+
 PROFILER_DEFINITIONS: dict[ProfilerKind, ProfilerDefinition] = {
     definition.kind: definition
     for definition in (

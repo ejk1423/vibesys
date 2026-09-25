@@ -3,7 +3,9 @@
 ``run_custom_profiler`` executes a bundle-declared command through the judge
 backend and collects its capture; ``interpret_custom_profiler`` turns that
 capture into a ``ProfilerSummary`` either directly (structured output) or via
-one Profiler agent turn without MCP tools. Both are exercised here with fake
+one Profiler agent turn without MCP tools. ``custom_profiler_summary``
+chains the two with a lazily rendered prompt, and ``declared_custom_profiler``
+lifts the command out of an input bundle. All are exercised here with fake
 backends and contexts, never a real sandbox or agent.
 """
 
@@ -16,17 +18,22 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from vibesys.evaluators.input_manifest import load_input_bundle
 from vibesys.loops import profiler as profiler_module
 from vibesys.loops.profiler import (
     CUSTOM_PROFILER_OUTPUT_TAIL_CHARS,
     PROFILE_DIR_ENV_VAR,
     TIMEOUT_EXIT_CODE,
     CustomProfilerCapture,
+    CustomProfilerRun,
     ProfilerTurn,
     custom_profiler_prompt_context,
+    custom_profiler_summary,
+    declared_custom_profiler,
     interpret_custom_profiler,
     run_custom_profiler,
 )
+from vibesys.profilers import CustomProfilerCommand
 from vibesys.schemas import ProfilerSummary
 from vs_sandbox.api import SandboxExecutionResult
 
@@ -70,6 +77,8 @@ def _ctx(workspace: Path, backend: object, **members: object) -> LoopContext:
     ctx.workspace = workspace
     ctx.judge_backend = backend
     ctx.run_environment_view = SimpleNamespace(framework_setup_timeout_seconds=0)
+    # A MagicMock attribute is truthy, which would read as a declared command.
+    ctx.custom_profiler = None
     for name, value in members.items():
         setattr(ctx, name, value)
     return cast("LoopContext", ctx)
@@ -370,3 +379,143 @@ def test_prompt_context_exposes_the_capture_for_custom_template() -> None:
         "artifact_files": ("report.txt",),
         "artifact_location": "progress-artifacts/profiles/round-0001",
     }
+
+
+# ---------------------------------------------------------------------------
+# custom_profiler_summary
+# ---------------------------------------------------------------------------
+
+_COMMAND = CustomProfilerCommand(command="python profiler/profile.py", timeout_seconds=30)
+
+
+def _summary(
+    tmp_path: Path,
+    backend: _FakeBackend,
+    *,
+    prompts: list[CustomProfilerCapture],
+    invoke: Callable[..., ProfilerSummary] | None = None,
+) -> tuple[ProfilerSummary | None, LoopContext]:
+    ctx = _ctx(tmp_path, backend)
+
+    def system_prompt(capture: CustomProfilerCapture) -> str:
+        prompts.append(capture)
+        return "RENDERED"
+
+    run = CustomProfilerRun(
+        command=_COMMAND,
+        artifact_root=tmp_path / "profiles" / "round-0001",
+        round_label="round-1-profiler",
+        fallback_suggestions="n/a",
+    )
+    result = custom_profiler_summary(ctx, run, system_prompt=system_prompt, invoke=invoke)
+    return result, ctx
+
+
+def test_summary_uses_structured_output_without_rendering_a_prompt(tmp_path: Path) -> None:
+    stdout = json.dumps(_SUMMARY)
+    backend = _FakeBackend(SandboxExecutionResult(output=stdout, exit_code=0, stdout=stdout))
+    prompts: list[CustomProfilerCapture] = []
+
+    result, ctx = _summary(tmp_path, backend, prompts=prompts)
+
+    assert result == ProfilerSummary.model_validate(_SUMMARY)
+    assert prompts == []
+    cast("MagicMock", ctx).invoke.assert_not_called()
+    [(command, timeout)] = backend.commands
+    assert command.endswith(" python profiler/profile.py")
+    assert timeout == 30
+
+
+def test_summary_is_none_without_evidence_and_never_renders(tmp_path: Path) -> None:
+    backend = _FakeBackend(SandboxExecutionResult(output="", exit_code=0))
+    prompts: list[CustomProfilerCapture] = []
+    seen: list[dict[str, object]] = []
+
+    def invoke(**kwargs: object) -> ProfilerSummary:
+        seen.append(kwargs)
+        pytest.fail("no agent turn without evidence")
+
+    result, ctx = _summary(tmp_path, backend, prompts=prompts, invoke=invoke)
+
+    assert result is None
+    assert prompts == []
+    assert seen == []
+    cast("MagicMock", ctx).invoke.assert_not_called()
+
+
+def test_summary_renders_once_and_interprets_unstructured_output(tmp_path: Path) -> None:
+    backend = _FakeBackend(SandboxExecutionResult(output="perf stat: 1,234 cycles", exit_code=0))
+    prompts: list[CustomProfilerCapture] = []
+    seen: list[dict[str, object]] = []
+    summary = ProfilerSummary.model_validate(_SUMMARY)
+
+    def invoke(**kwargs: object) -> ProfilerSummary:
+        seen.append(kwargs)
+        return summary
+
+    result, ctx = _summary(tmp_path, backend, prompts=prompts, invoke=invoke)
+
+    assert result is summary
+    [capture] = prompts
+    assert capture.output == "perf stat: 1,234 cycles"
+    assert capture.summary is None
+    [kwargs] = seen
+    assert kwargs["system_prompt"] == "RENDERED"
+    assert kwargs["round_label"] == "round-1-profiler"
+    assert kwargs["mcp_servers"] is None
+    fallback = cast("Callable[[], ProfilerSummary]", kwargs["fallback_factory"])()
+    assert fallback.suggestions == "n/a"
+    cast("MagicMock", ctx).invoke.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# declared_custom_profiler
+# ---------------------------------------------------------------------------
+
+_MANIFEST = """version = 1
+[agent]
+domain = "generic"
+[accuracy]
+command = ["python", "acc.py"]
+[benchmark]
+command = ["python", "bench.py"]
+"""
+
+
+def _write_bundle(root: Path, *, profiler: str = "") -> Path:
+    (root / "vibesys.input.toml").write_text(_MANIFEST + profiler)
+    (root / "OBJECTIVE.md").write_text("objective\n")
+    return root
+
+
+def test_declared_custom_profiler_is_none_without_a_profiler_section(tmp_path: Path) -> None:
+    bundle = load_input_bundle(_write_bundle(tmp_path))
+
+    assert declared_custom_profiler(bundle) is None
+
+
+def test_declared_custom_profiler_carries_the_display_command_and_timeout(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "prof.sh").write_text("#!/bin/sh\n")
+    bundle = load_input_bundle(
+        _write_bundle(
+            tmp_path,
+            profiler='[profiler]\ncommand = ["bin/prof.sh", "a b"]\ntimeout_seconds = 9\n',
+        )
+    )
+
+    assert declared_custom_profiler(bundle) == CustomProfilerCommand(
+        command="bin/prof.sh 'a b'", timeout_seconds=9
+    )
+
+
+def test_declared_custom_profiler_timeout_defaults_to_none(tmp_path: Path) -> None:
+    bundle = load_input_bundle(
+        _write_bundle(tmp_path, profiler='[profiler]\ncommand = ["python", "prof.py"]\n')
+    )
+
+    assert declared_custom_profiler(bundle) == CustomProfilerCommand(
+        command="python prof.py", timeout_seconds=None
+    )

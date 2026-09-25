@@ -72,6 +72,8 @@ def _plan(identifier: str, **fields: object) -> OrchestratorPlan:
 
 def _ctx(**members: object) -> "LoopContext":
     ctx = MagicMock()
+    # A MagicMock attribute is truthy, which would read as a declared command.
+    members.setdefault("custom_profiler", None)
     for name, value in members.items():
         setattr(ctx, name, value)
     return cast("LoopContext", ctx)

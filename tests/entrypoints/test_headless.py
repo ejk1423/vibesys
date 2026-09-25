@@ -1807,6 +1807,19 @@ def test_instrumented_microservice_task_profiles_with_otel_by_default(tmp_path: 
     assert invocation.args.profiler is ProfilerKind.OTEL
 
 
+def test_bundle_declared_profiler_command_keeps_auto(tmp_path: Path) -> None:
+    """A ``[profiler]`` command is the more specific default, so ``auto`` yields to it."""
+
+    project = _write_microservice_project(tmp_path, traced=True)
+    manifest = project / "vibesys.input.toml"
+    manifest.write_text(
+        manifest.read_text() + '\n[profiler]\ncommand = ["python", "-c", "print(1)"]\n'
+    )
+
+    invocation = parse_cli_invocation(["--input", str(project)])
+    assert invocation.args.profiler is ProfilerKind.AUTO
+
+
 def test_uninstrumented_microservice_task_keeps_auto(tmp_path: Path) -> None:
     """Without a collector there is nothing for the OTel profiler to read."""
 

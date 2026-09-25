@@ -12,8 +12,10 @@ This module owns the parts that are identical across the two: the
 ``MCPServerSpec`` factory, the agent-invocation wrapper, and the
 advisory custom-profiler path (run a bundle-declared command, then use
 its structured summary directly or ask the profiler agent to interpret
-the capture). Each loop still renders its own prompt (the templates and
-bound variables differ) and decides what to do with the returned summary.
+the capture). ``declared_custom_profiler`` lifts the command out of an
+input bundle and ``custom_profiler_summary`` drives that path end to
+end. Each loop still renders its own prompt (the templates and bound
+variables differ) and decides what to do with the returned summary.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from pydantic import ValidationError
 from vibesys.events import FrameworkSource
 from vibesys.loops.gates import framework_command_timeout
 from vibesys.profilers import (
+    CustomProfilerCommand,
     ProfilerDefinition,
     ProfilerKind,
     profiler_definition,
@@ -41,6 +44,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from vibesys.evaluators.input_manifest import InputBundle
     from vibesys.run import LoopContext
 
     ProfilerInvoke = Callable[..., ProfilerSummary]
@@ -348,3 +352,57 @@ def interpret_custom_profiler(
         mcp_servers=None,
         invoke=invoke,
     )
+
+
+def declared_custom_profiler(bundle: InputBundle) -> CustomProfilerCommand | None:
+    """Return the ``[profiler]`` command an input bundle declares, if any."""
+    if bundle.manifest.profiler is None:
+        return None
+    return CustomProfilerCommand(
+        command=bundle.manifest.profiler.display(resolved_command=bundle.resolved_profiler_command),
+        timeout_seconds=bundle.manifest.profiler.timeout_seconds,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CustomProfilerRun:
+    """One custom profiler execution: what to run, where it writes, how it is labeled."""
+
+    command: CustomProfilerCommand
+    artifact_root: Path
+    round_label: str
+    fallback_suggestions: str = "Re-run profiling on the next round."
+
+
+def custom_profiler_summary(
+    ctx: LoopContext,
+    run: CustomProfilerRun,
+    *,
+    system_prompt: Callable[[CustomProfilerCapture], str],
+    invoke: ProfilerInvoke | None = None,
+) -> ProfilerSummary | None:
+    """Run the bundle-declared profiler command and return its :class:`ProfilerSummary`.
+
+    A structured summary the command emitted is returned as is; a capture
+    with no evidence yields ``None``. Otherwise ``system_prompt`` renders the
+    interpretation prompt from the capture (lazily, so nothing renders when
+    the command already answered) and one Profiler agent turn interprets it.
+    Never raises: command and agent failures become framework warnings.
+    """
+    capture = run_custom_profiler(
+        ctx,
+        command=run.command.command,
+        timeout_seconds=run.command.timeout_seconds,
+        artifact_root=run.artifact_root,
+        round_label=run.round_label,
+    )
+    if capture.summary is not None:
+        return capture.summary
+    if not capture.has_evidence:
+        return None
+    turn = ProfilerTurn(
+        system_prompt=system_prompt(capture),
+        round_label=run.round_label,
+        fallback_suggestions=run.fallback_suggestions,
+    )
+    return interpret_custom_profiler(ctx, capture, turn, invoke=invoke)
